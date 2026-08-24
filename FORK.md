@@ -20,7 +20,7 @@ waiting on maintainer review. Our implementation is deliberately shaped to match
 
 ## What we changed
 
-Everything lives in one commit, `feat(env): add E2B cloud sandbox environment`:
+The change set, spread over a few `feat(env):` commits:
 
 - `src/minisweagent/environments/extra/e2b.py` — new environment class.
 - `src/minisweagent/environments/__init__.py` — registers the `e2b` key.
@@ -78,5 +78,5 @@ on `release: published` and would attempt a PyPI upload.
 ## When upstream merges #792
 
 1. Switch the documentation's pin to the upstream release that contains it.
-2. Re-propose our five deltas upstream as separate, individually reviewable PRs.
+2. Re-propose our seven deltas upstream as separate, individually reviewable PRs.
 3. Retire this fork.
