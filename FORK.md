@@ -34,7 +34,7 @@ Nothing else is touched, so merging upstream `main` should stay mechanical.
 ### Deltas against PR 792
 
 The class follows PR 792 closely (same name, same `e2b` registry key, no
-vendor-specific fields) and adds five things we hit while running this on real
+vendor-specific fields) and adds six things we hit while running this on real
 evaluation images. Each is generic — none of them mention any particular cloud:
 
 1. **`mkdir -p <cwd>` at startup.** `docker run -w` creates the working directory; a
@@ -51,12 +51,15 @@ evaluation images. Each is generic — none of them mention any particular cloud
    lookup short-circuits on `Template.exists()`, so a name derived from the image alone
    silently returns a template built with a stale `memory_mb`/`cpu_count`. This is a real
    bug in PR 792 and worth reporting upstream on its own.
+6. **`interpreter` is honoured** like `docker` and `contree` do. The SDK already spawns
+   commands through `bash -l -c`, so this is one shell more than strictly necessary — but
+   `config/benchmarks/swebench.yaml` sets `interpreter`, and a pydantic model that ignores
+   extra keys would have dropped it without a word.
 
 Deliberately *not* carried over from our earlier private implementation, to keep the class
-minimal: an `interpreter` wrapper (the SDK already runs commands via `bash -l -c`), a
-`request_timeout` passthrough (inert in current e2b SDKs — the command `timeout` bounds the
-whole stream), host env forwarding, and evaluation-suite-specific working-directory probing.
-Those belong in the orchestration layer, not here.
+minimal: a `request_timeout` passthrough (inert in current e2b SDKs — the command `timeout`
+bounds the whole stream), host env forwarding, and evaluation-suite-specific
+working-directory probing. Those belong in the orchestration layer, not here.
 
 ## Pinning this fork
 

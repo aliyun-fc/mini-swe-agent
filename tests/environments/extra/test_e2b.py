@@ -133,6 +133,20 @@ class TestE2BEnvironmentExecute:
         self._mock_result(env, stdout="ok\n")
         assert env.execute("echo ok")["output"] == "ok\n"
 
+    def test_execute_hands_action_to_the_interpreter(self):
+        # swebench.yaml configures `interpreter`, so ignoring it would silently run
+        # actions under a shell the user did not ask for.
+        env = _make_env()
+        self._mock_result(env)
+        env.execute({"command": "echo 'hi there'"})
+        assert env.sandbox.commands.run.call_args.args[0] == """bash -c 'echo '"'"'hi there'"'"''"""
+
+    def test_empty_interpreter_runs_command_directly(self):
+        env = _make_env(interpreter=[])
+        self._mock_result(env)
+        env.execute({"command": "echo hi"})
+        assert env.sandbox.commands.run.call_args.args[0] == "echo hi"
+
     def test_execute_passes_user_and_cwd(self):
         env = _make_env(cwd="/testbed", run_as_user="worker", timeout=90)
         self._mock_result(env)

@@ -38,6 +38,13 @@ class E2BEnvironmentConfig(BaseModel):
     """Timeout for executing commands in the sandbox."""
     env: dict[str, str] = Field(default_factory=dict)
     """Environment variables to set when executing commands."""
+    interpreter: list[str] = ["bash", "-c"]
+    """Shell that actions are handed to, like :class:`~minisweagent.environments.docker.DockerEnvironment`.
+
+    The e2b SDK already spawns commands via ``bash -l -c``, so this is one shell more
+    than strictly needed -- but silently ignoring a configured interpreter would be
+    worse, and ``config/benchmarks/swebench.yaml`` does configure one.
+    """
     sandbox_timeout: int = 3600
     """How long (in seconds) the sandbox is allowed to stay alive."""
     run_as_user: str = "root"
@@ -274,7 +281,7 @@ class E2BEnvironment:
         command = action.get("command", "") if isinstance(action, dict) else action
         try:
             result = self.sandbox.commands.run(
-                command,
+                shlex.join([*self.config.interpreter, command]) if self.config.interpreter else command,
                 user=self.config.run_as_user or None,
                 cwd=cwd or self.config.cwd,
                 timeout=timeout or self.config.timeout,
