@@ -166,6 +166,17 @@ class TestE2BEnvironmentExecute:
         assert env.sandbox.commands.run.call_args.kwargs["cwd"] == "/testbed"
         assert env.sandbox.commands.run.call_args.kwargs["timeout"] == 90
 
+    def test_forwards_host_env_but_env_wins(self, monkeypatch):
+        monkeypatch.setenv("FORWARDED", "from-host")
+        monkeypatch.setenv("SHADOWED", "from-host")
+        env = _make_env(forward_env=["FORWARDED", "SHADOWED", "NOT_SET_ON_HOST"], env={"SHADOWED": "from-config"})
+        self._mock_result(env)
+        env.execute({"command": "env"})
+        assert env.sandbox.commands.run.call_args.kwargs["envs"] == {
+            "FORWARDED": "from-host",
+            "SHADOWED": "from-config",
+        }
+
     def test_empty_run_as_user_defers_to_template_default(self):
         env = _make_env(run_as_user="")
         self._mock_result(env)

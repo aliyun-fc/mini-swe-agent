@@ -38,6 +38,11 @@ class E2BEnvironmentConfig(BaseModel):
     """Timeout for executing commands in the sandbox."""
     env: dict[str, str] = Field(default_factory=dict)
     """Environment variables to set when executing commands."""
+    forward_env: list[str] = []
+    """Environment variables to forward from the host into the sandbox.
+    Variables are only forwarded if they are set in the host environment.
+    In case of conflict with `env`, the `env` variables take precedence.
+    """
     interpreter: list[str] = ["bash", "-c"]
     """Shell that actions are handed to, like :class:`~minisweagent.environments.docker.DockerEnvironment`.
 
@@ -237,13 +242,19 @@ class E2BEnvironment:
         match = re.match(r"\s*(\d{3})\b", str(e))
         return match is not None and match.group(1) == "404"
 
-    def __init__(self, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *,
+        config_class: type = E2BEnvironmentConfig,
+        logger: logging.Logger | None = None,
+        **kwargs: Any,
+    ) -> None:
         from e2b.exceptions import SandboxException
 
-        self.logger = logging.getLogger("minisweagent.environment.e2b")
-        self.config = E2BEnvironmentConfig(**kwargs)
+        self.logger = logger or logging.getLogger("minisweagent.environment.e2b")
+        self.config = config_class(**kwargs)
         manager = E2BTemplateManager(self.config)
-        self.template = manager.get_or_build(self.config.image)
+        self.template = self._resolve_template(manager)
         self.logger.info("Creating E2B sandbox (template: %s)...", self.template)
         try:
             self.sandbox = self._create_sandbox()
@@ -256,6 +267,10 @@ class E2BEnvironment:
         self.logger.info("E2B sandbox ready (id: %s)", self.sandbox.sandbox_id)
         _active_sandboxes.add(self)
         self._prepare_cwd()
+
+    def _resolve_template(self, manager: E2BTemplateManager) -> str:
+        """Override to reuse an already-built template instead of resolving one from the image."""
+        return manager.get_or_build(self.config.image)
 
     def _create_sandbox(self):
         """Override to pass extra Sandbox.create options (metadata, network, volumes, ...)."""
@@ -293,14 +308,18 @@ class E2BEnvironment:
 
     def execute(self, action: dict, cwd: str = "", *, timeout: int | None = None) -> dict[str, Any]:
         """Execute a command in the sandbox and return the output."""
+        import os
+
         command = action.get("command", "") if isinstance(action, dict) else action
+        envs = {k: os.environ[k] for k in self.config.forward_env if k in os.environ}
+        envs.update(self.config.env)  # `env` wins over `forward_env`, as in DockerEnvironment
         try:
             result = self.sandbox.commands.run(
                 shlex.join([*self.config.interpreter, command]) if self.config.interpreter else command,
                 user=self.config.run_as_user or None,
                 cwd=cwd or self.config.cwd,
                 timeout=timeout or self.config.timeout,
-                envs=self.config.env or None,
+                envs=envs or None,
             )
             output: dict[str, Any] = {
                 "output": result.stdout + result.stderr,
