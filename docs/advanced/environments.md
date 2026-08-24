@@ -30,3 +30,5 @@ On top, there are a few more specialized environment classes that you can use:
 
 * **`contree`** ([`ContreeEnvironment`](../reference/environments/contree.md)) - Uses [ConTree](https://contree.dev/) for safe code execution sandboxing. Platform that built for agents and supports Git-like execution.
 
+* **`e2b`** ([`E2BEnvironment`](../reference/environments/e2b.md)) - Executes commands in [E2B](https://e2b.dev) cloud sandboxes. Runs arbitrary Docker images without a local Docker daemon, so it scales SWE-bench runs off your machine.
+

@@ -108,6 +108,7 @@ nav:
       - "BubblewrapEnvironment": "reference/environments/bubblewrap.md"
       - "ContreeEnvironment": "reference/environments/contree.md"
       - "SwerexModalEnvironment": "reference/environments/swerex_modal.md"
+      - "E2BEnvironment": "reference/environments/e2b.md"
     - Run Scripts:
       - "Hello World": "reference/run/hello_world.md"
       - "mini": "reference/run/mini.md"

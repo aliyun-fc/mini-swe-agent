@@ -53,6 +53,7 @@ full = [
     "swe-rex>=1.4.0",
     "mini-swe-agent[modal]",
     "mini-swe-agent[contree]",
+    "mini-swe-agent[e2b]",
 ]
 
 modal = [
@@ -79,6 +80,13 @@ dev = [
 
 contree = [
     "contree-sdk>=0.2.0",
+]
+
+e2b = [
+    # 2.39.1 is the version this integration was verified against. The template
+    # build API it relies on (`Template().from_image()`, `Template.exists()`) only
+    # exists in the 2.x line.
+    "e2b>=2.39.1,<3",
 ]
 
 [project.urls]
