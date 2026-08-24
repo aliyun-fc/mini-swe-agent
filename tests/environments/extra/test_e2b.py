@@ -42,6 +42,17 @@ class TestE2BEnvironmentConfig:
         assert (cfg.sandbox_timeout, cfg.cpu_count) == (7200, 4)
 
 
+class TestApiParams:
+    def test_unset_fields_are_omitted(self):
+        # Anything we pass explicitly overrides the SDK's env-var default, so an
+        # unset field must not reach the SDK as None.
+        assert _make_env().config.api_params() == {}
+
+    def test_passes_through_what_is_set(self):
+        env = _make_env(api_key="k", domain="example.com")
+        assert env.config.api_params() == {"api_key": "k", "domain": "example.com"}
+
+
 class TestTemplateName:
     def test_basic_sanitization(self):
         assert re.match(r"^[a-z0-9-]+$", _make_manager()._template_name("python:3.11"))

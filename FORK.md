@@ -34,7 +34,7 @@ Nothing else is touched, so merging upstream `main` should stay mechanical.
 ### Deltas against PR 792
 
 The class follows PR 792 closely (same name, same `e2b` registry key, no
-vendor-specific fields) and adds six things we hit while running this on real
+vendor-specific fields) and adds seven things we hit while running this on real
 evaluation images. Each is generic — none of them mention any particular cloud:
 
 1. **`mkdir -p <cwd>` at startup.** `docker run -w` creates the working directory; a
@@ -55,6 +55,11 @@ evaluation images. Each is generic — none of them mention any particular cloud
    commands through `bash -l -c`, so this is one shell more than strictly necessary — but
    `config/benchmarks/swebench.yaml` sets `interpreter`, and a pydantic model that ignores
    extra keys would have dropped it without a word.
+7. **`domain` and `api_url` are configurable**, not just `api_key`. Both are standard e2b
+   SDK connection parameters. PR 792 exposes only `api_key`, which forces the control plane
+   to be selected through process-global environment variables — unworkable when one
+   process has to talk to two of them. A `_create_sandbox()` hook is also provided so
+   subclasses can pass extra `Sandbox.create` options (metadata, network, volumes).
 
 Deliberately *not* carried over from our earlier private implementation, to keep the class
 minimal: a `request_timeout` passthrough (inert in current e2b SDKs — the command `timeout`

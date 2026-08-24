@@ -69,15 +69,29 @@ class E2BEnvironmentConfig(BaseModel):
     build_timeout: int = 1800
     """Timeout for template builds in seconds (default 30 min to handle large images)."""
 
-    # E2B authentication (can also be set via the E2B_API_KEY env var)
+    # E2B connection (each falls back to the matching E2B_* environment variable)
     api_key: str | None = None
     """E2B API key. Falls back to the E2B_API_KEY environment variable."""
+    domain: str | None = None
+    """E2B domain. Falls back to E2B_DOMAIN, then to e2b.dev.
+
+    Any E2B-compatible control plane works: set this (or E2B_DOMAIN) and the SDK
+    derives the API URL as ``https://api.<domain>``. Set it here rather than through
+    the environment when one process has to talk to more than one control plane.
+    """
+    api_url: str | None = None
+    """E2B API URL. Falls back to E2B_API_URL, then to ``https://api.<domain>``."""
 
     # Private registry credentials (passed to Template().from_image())
     registry_username: str | None = None
     """Username for authenticating against a private Docker registry."""
     registry_password: str | None = None
     """Password for authenticating against a private Docker registry."""
+
+    def api_params(self) -> dict[str, str]:
+        """Connection kwargs for the e2b SDK. Unset fields are left to the SDK's own env defaults."""
+        params = {"api_key": self.api_key, "domain": self.domain, "api_url": self.api_url}
+        return {k: v for k, v in params.items() if v is not None}
 
 
 class E2BTemplateManager:
@@ -130,7 +144,7 @@ class E2BTemplateManager:
         from e2b import Template
 
         template_name = self._template_name(docker_image)
-        if not Template.exists(template_name, api_key=self.config.api_key) or self.config.skip_cache:
+        if not Template.exists(template_name, **self.config.api_params()) or self.config.skip_cache:
             self.logger.info(
                 "E2B template %s not found. Starting build (up to %d seconds)...",
                 template_name,
@@ -173,7 +187,7 @@ class E2BTemplateManager:
                 memory_mb=self.config.memory_mb,
                 skip_cache=self.config.skip_cache,
                 tags=self.config.tags or None,
-                api_key=self.config.api_key,
+                **self.config.api_params(),
             )
 
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
@@ -224,7 +238,6 @@ class E2BEnvironment:
         return match is not None and match.group(1) == "404"
 
     def __init__(self, **kwargs: Any) -> None:
-        from e2b import Sandbox
         from e2b.exceptions import SandboxException
 
         self.logger = logging.getLogger("minisweagent.environment.e2b")
@@ -233,24 +246,26 @@ class E2BEnvironment:
         self.template = manager.get_or_build(self.config.image)
         self.logger.info("Creating E2B sandbox (template: %s)...", self.template)
         try:
-            self.sandbox = Sandbox.create(
-                template=self.template,
-                timeout=self.config.sandbox_timeout,
-                api_key=self.config.api_key,
-            )
+            self.sandbox = self._create_sandbox()
         except SandboxException as e:
             if not self._is_stale_template_error(e):
                 raise
             self.logger.warning("Template %s not found (stale cache). Rebuilding...", self.template)
             manager.rebuild(self.config.image)
-            self.sandbox = Sandbox.create(
-                template=self.template,
-                timeout=self.config.sandbox_timeout,
-                api_key=self.config.api_key,
-            )
+            self.sandbox = self._create_sandbox()
         self.logger.info("E2B sandbox ready (id: %s)", self.sandbox.sandbox_id)
         _active_sandboxes.add(self)
         self._prepare_cwd()
+
+    def _create_sandbox(self):
+        """Override to pass extra Sandbox.create options (metadata, network, volumes, ...)."""
+        from e2b import Sandbox
+
+        return Sandbox.create(
+            template=self.template,
+            timeout=self.config.sandbox_timeout,
+            **self.config.api_params(),
+        )
 
     def _prepare_cwd(self) -> None:
         """Make ``cwd`` usable, mirroring what ``docker run -w`` gives us for free.
