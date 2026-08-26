@@ -1,9 +1,14 @@
 """Tests for the E2B cloud sandbox environment."""
 
+import gc
 import re
+import threading
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
+from e2b.api.client.models import TemplateBuildStatus
+from e2b.exceptions import TimeoutException
 
 from minisweagent.environments.extra.e2b import (
     E2BEnvironment,
@@ -55,64 +60,156 @@ class TestApiParams:
 
 class TestTemplateName:
     def test_basic_sanitization(self):
-        assert re.match(r"^[a-z0-9-]+$", _make_manager()._template_name("python:3.11"))
+        assert re.match(r"^[a-z0-9-]+$", _make_manager().template_name("python:3.11"))
 
     def test_length_limit(self):
-        assert len(_make_manager()._template_name("a" * 100 + ":latest")) <= 63
+        assert len(_make_manager().template_name("a" * 100 + ":latest")) <= 63
 
     def test_deterministic(self):
         image = "swebench/sweb.eval.x86_64.django__django-11099:latest"
-        assert _make_manager()._template_name(image) == _make_manager()._template_name(image)
+        assert _make_manager().template_name(image) == _make_manager().template_name(image)
 
     def test_different_images_different_names(self):
-        assert _make_manager()._template_name("image-a:latest") != _make_manager()._template_name("image-b:latest")
+        assert _make_manager().template_name("image-a:latest") != _make_manager().template_name("image-b:latest")
 
     def test_no_triple_hyphens(self):
         # Dots and slashes become hyphens; consecutive runs are collapsed to "--"
-        assert "---" not in _make_manager()._template_name("a/b/c.d.e:latest")
+        assert "---" not in _make_manager().template_name("a/b/c.d.e:latest")
 
     def test_empty_prefix_falls_back_to_hash(self):
-        assert len(_make_manager()._template_name("---")) == 8
+        assert len(_make_manager().template_name("---")) == 8
 
     @pytest.mark.parametrize(("field", "value"), [("memory_mb", 8192), ("cpu_count", 4)])
     def test_build_options_change_the_name(self, field, value):
         # get_or_build() short-circuits on Template.exists(), so a name that ignored
         # the resource spec would silently hand back a template built with the old one.
         image = "swebench/test-image:latest"
-        assert _make_manager()._template_name(image) != _make_manager(**{field: value})._template_name(image)
+        assert _make_manager().template_name(image) != _make_manager(**{field: value}).template_name(image)
 
 
-class TestIsStaleTemplateError:
-    def test_404_status_prefix_matches(self):
-        # e2b formats API errors as "{status_code}: {message}".
-        assert E2BEnvironment._is_stale_template_error(Exception("404: template foo not found")) is True
+class TestGetOrBuild:
+    def test_concurrent_first_build_builds_once(self):
+        # Without the per-name lock every thread sees exists() == False and builds the
+        # same alias: one wins, the losers get "409 ... resource conflict" and each leaves
+        # an orphan template record behind (measured: 4 threads → 3 losers, 8 → 7).
+        manager = _make_manager()
+        built: list[str] = []
+        start = threading.Barrier(8)
+
+        def slow_build(docker_image, template_name):
+            # A real build takes seconds; an instant one would hide the race, because the
+            # first thread would finish before the others get to their existence check.
+            time.sleep(0.05)
+            built.append(template_name)
+
+        def enter_and_build():
+            start.wait()
+            manager.get_or_build("swebench/test-image:latest")
+
+        with (
+            patch("e2b.Template.exists", side_effect=lambda name, **kw: name in built),
+            patch.object(E2BTemplateManager, "_build_template", side_effect=slow_build),
+        ):
+            threads = [threading.Thread(target=enter_and_build) for _ in range(8)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+        assert built == [manager.template_name("swebench/test-image:latest")]
+
+    def test_rebuild_deletes_first(self):
+        # The control plane allows a single build per template, so building over an
+        # existing one fails with "409: template build is not allowed in current status".
+        calls = []
+        with (
+            patch.object(E2BTemplateManager, "_delete_template", side_effect=lambda name: calls.append("delete")),
+            patch.object(E2BTemplateManager, "_build_template", side_effect=lambda image, name: calls.append("build")),
+        ):
+            _make_manager().rebuild("swebench/test-image:latest")
+        assert calls == ["delete", "build"]
+
+
+class TestRepair:
+    def _manager(self, status, calls):
+        manager = _make_manager()
+        manager.template_status = lambda name: status
+        manager._delete_template = lambda name: calls.append("delete")
+        manager._build_template = lambda image, name: calls.append("build")
+        manager.wait_until_ready = lambda name: calls.append("wait")
+        return manager
+
+    def test_ready_template_is_left_alone(self):
+        # rebuild() deletes unconditionally, so this re-check under the lock is what stops
+        # a second caller from deleting the template the first one has just repaired.
+        calls = []
+        self._manager(TemplateBuildStatus.READY, calls).repair("swebench/test-image:latest")
+        assert calls == []
+
+    @pytest.mark.parametrize("status", [TemplateBuildStatus.BUILDING, TemplateBuildStatus.WAITING])
+    def test_build_in_flight_is_waited_for(self, status):
+        # Deleting a build somebody else started would break that other runner.
+        calls = []
+        self._manager(status, calls).repair("swebench/test-image:latest")
+        assert calls == ["wait"]
+
+    @pytest.mark.parametrize("status", [TemplateBuildStatus.ERROR, None])
+    def test_broken_or_missing_template_is_rebuilt(self, status):
+        calls = []
+        self._manager(status, calls).repair("swebench/test-image:latest")
+        assert calls == ["delete", "build"]
+
+
+class TestIsRecoverableTemplateError:
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "404: template foo not found",
+            "409: cannot create sandbox: template is CREATE_FAILED, only READY templates can be used",
+        ],
+    )
+    def test_recoverable_statuses_match(self, message):
+        # e2b formats API errors as "{status_code}: {message}". 409 must be recoverable:
+        # treating it as fatal is what leaves a failed template permanently unusable.
+        assert E2BEnvironment._is_recoverable_template_error(Exception(message)) is True
 
     @pytest.mark.parametrize("message", ["500: internal error", "429: rate limited"])
     def test_other_status_does_not_match(self, message):
-        assert E2BEnvironment._is_stale_template_error(Exception(message)) is False
+        assert E2BEnvironment._is_recoverable_template_error(Exception(message)) is False
 
     @pytest.mark.parametrize("message", ["Sandbox abc404def failed", "error in /path/404/x"])
     def test_incidental_404_substring_does_not_match(self, message):
         # "404" appearing inside an id/path must not trigger a costly rebuild.
-        assert E2BEnvironment._is_stale_template_error(Exception(message)) is False
+        assert E2BEnvironment._is_recoverable_template_error(Exception(message)) is False
 
 
 class TestPrepareCwd:
+    def _mock_run(self, env, stdout=""):
+        result = MagicMock()
+        result.stdout = stdout
+        env.sandbox.commands.run.return_value = result
+        return result
+
     def test_creates_cwd_and_marks_it_safe_for_git(self):
         # `docker run -w` creates the working directory and a sandbox does not; a
         # missing cwd fails at process spawn with no exit code, so execute() would
         # report an infrastructure error on every single step.
         env = _make_env(cwd="/testbed")
+        self._mock_run(env)
         env._prepare_cwd()
 
         commands = [call.args[0] for call in env.sandbox.commands.run.call_args_list]
-        assert commands == ["mkdir -p /testbed", "git config --global --add safe.directory /testbed"]
+        assert commands == [
+            f"test -d /testbed || echo {E2BEnvironment._CWD_MISSING_MARKER}; mkdir -p /testbed",
+            "git config --global --add safe.directory /testbed",
+        ]
         assert all(call.kwargs["user"] == "root" for call in env.sandbox.commands.run.call_args_list)
 
     def test_quotes_cwd(self):
         env = _make_env(cwd="/two words")
+        self._mock_run(env)
         env._prepare_cwd()
-        assert env.sandbox.commands.run.call_args_list[0].args[0] == "mkdir -p '/two words'"
+        assert "mkdir -p '/two words'" in env.sandbox.commands.run.call_args_list[0].args[0]
 
     def test_tolerates_failure(self):
         # In a prepared evaluation image the directory exists already and may not be
@@ -121,6 +218,26 @@ class TestPrepareCwd:
         env.sandbox.commands.run.side_effect = RuntimeError("permission denied")
         env._prepare_cwd()
         assert env.sandbox.commands.run.call_count == 2
+
+    def test_existing_cwd_is_not_reported(self):
+        env = _make_env(cwd="/testbed")
+        self._mock_run(env)
+        env._prepare_cwd()
+        assert env.logger.warning.call_count == 0
+
+    def test_created_cwd_is_reported(self):
+        # A cwd that is not in the image means the repository is elsewhere, and nothing
+        # downstream notices: the agent works in an empty directory and submits nothing.
+        env = _make_env(cwd="/testbed")
+        self._mock_run(env, stdout=f"{E2BEnvironment._CWD_MISSING_MARKER}\n")
+        env._prepare_cwd()
+        assert "created empty" in env.logger.warning.call_args.args[0]
+
+    def test_require_existing_cwd_fails_loudly(self):
+        env = _make_env(cwd="/testbed", require_existing_cwd=True)
+        self._mock_run(env, stdout=f"{E2BEnvironment._CWD_MISSING_MARKER}\n")
+        with pytest.raises(RuntimeError, match="created empty"):
+            env._prepare_cwd()
 
 
 class TestE2BEnvironmentExecute:
@@ -198,6 +315,20 @@ class TestE2BEnvironmentExecute:
         assert output["output"] == "partial stdout\nboom\n"
         assert output["exception_info"] == ""
 
+    def test_signal_terminated_process_is_labelled(self):
+        # The SDK reports -1 for any signal, and -1 is also what this class uses for an
+        # infrastructure error. An empty exception_info would claim this was an ordinary
+        # command result -- the exit code stays as it is, but it has to be explained.
+        env = _make_env()
+        exc = Exception("Command exited with code -1")
+        exc.stdout, exc.stderr, exc.exit_code = "", "", -1
+        env.sandbox.commands.run.side_effect = exc
+
+        output = env.execute({"command": "kill -9 $$"})
+
+        assert output["returncode"] == -1
+        assert "terminated by a signal" in output["exception_info"]
+
     def test_execute_exception(self):
         env = _make_env()
         env.sandbox.commands.run.side_effect = RuntimeError("connection lost")
@@ -207,6 +338,42 @@ class TestE2BEnvironmentExecute:
         assert output["returncode"] == -1
         assert "connection lost" in output["exception_info"]
         assert output["extra"]["exception_type"] == "RuntimeError"
+
+    def test_timeout_keeps_what_the_command_already_printed(self):
+        # The SDK's timeout carries no stdout/stderr at all, so the streaming callbacks are
+        # the only way to keep the output of a command that ran out of time.
+        env = _make_env()
+
+        def times_out(cmd, **kwargs):
+            kwargs["on_stdout"]("collected 42 tests\n")
+            raise TimeoutException("command timed out")
+
+        env.sandbox.commands.run.side_effect = times_out
+
+        output = env.execute({"command": "pytest --collect-only"}, timeout=3)
+
+        assert output["output"] == "collected 42 tests\n"
+        assert output["returncode"] == -1
+        assert "timed out after 3 seconds" in output["exception_info"]
+
+    def test_stderr_noise_does_not_shadow_the_submission_sentinel(self):
+        # bash writes its warnings before the command produces anything, so merging the two
+        # streams in arrival order would put noise on the first line and silently break the
+        # submission protocol. stdout has to stay in front of stderr.
+        env = _make_env()
+        submission = "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT\ndiff --git a/f.py b/f.py\n"
+
+        def noisy(cmd, **kwargs):
+            kwargs["on_stderr"]("bash: /root/.bashrc: Permission denied\n")
+            kwargs["on_stdout"](submission)
+            return self._mock_result(env, stdout=submission, stderr="bash: /root/.bashrc: Permission denied\n")
+
+        env.sandbox.commands.run.side_effect = noisy
+
+        with pytest.raises(Submitted) as exc_info:
+            env.execute({"command": "submit"})
+
+        assert exc_info.value.messages[0]["extra"]["submission"].startswith("diff --git")
 
     def test_execute_raises_submitted(self):
         env = _make_env()
@@ -299,4 +466,20 @@ class TestAtexitCleanup:
 
         env1.sandbox.kill.assert_called_once()
         env2.sandbox.kill.assert_called_once()
-        assert not {env1, env2} & e2b_mod._active_sandboxes
+        assert env1 not in e2b_mod._active_sandboxes and env2 not in e2b_mod._active_sandboxes
+
+    def test_dropped_environment_kills_its_sandbox(self):
+        # The registry must not keep the environment alive: a strong one holds every
+        # reference count above zero, which makes __del__ unreachable and leaves the
+        # sandbox running -- and billed -- until the process ends. The tests above do not
+        # catch that, because they all release the sandbox explicitly.
+        from minisweagent.environments.extra import e2b as e2b_mod
+
+        env = _make_env()
+        sandbox = env.sandbox
+        e2b_mod._active_sandboxes.add(env)
+
+        del env
+        gc.collect()
+
+        sandbox.kill.assert_called_once()

@@ -9,13 +9,20 @@ import json
 import logging
 import re
 import shlex
+import threading
+import time
+import weakref
 from typing import Any
 
 from pydantic import BaseModel, Field
 
-# Module-level registry of live sandboxes for best-effort cleanup on exit
-# (covers Ctrl+C and unhandled exceptions where __del__ may not be called).
-_active_sandboxes: set[E2BEnvironment] = set()
+#: Live sandboxes, for best-effort cleanup at exit (covers Ctrl+C and unhandled
+#: exceptions). Weak so that an environment nobody holds on to any more stays
+#: collectable: a strong registry keeps every reference count above zero, which makes
+#: ``__del__`` unreachable and leaves such a sandbox running -- and billed -- until the
+#: process ends. The two paths are complementary: garbage collection releases dropped
+#: environments, ``atexit`` releases the ones still alive.
+_active_sandboxes: weakref.WeakSet[E2BEnvironment] = weakref.WeakSet()
 
 
 def _cleanup_all_sandboxes() -> None:
@@ -60,6 +67,14 @@ class E2BEnvironmentConfig(BaseModel):
     template's default (unprivileged) user leaves the agent unable to edit files.
     Set to an empty string to use the template's default user.
     """
+    require_existing_cwd: bool = False
+    """Fail instead of warning when ``cwd`` has to be created.
+
+    A working directory that is not already in the image means the repository is
+    somewhere else, and nothing downstream notices: commands succeed in the empty
+    directory, the agent runs to completion and submits an empty patch. Turn this on
+    for repository-based benchmarks, where a created ``cwd`` is always a misconfiguration.
+    """
 
     # Template build options (passed to Template.build())
     cpu_count: int = 2
@@ -99,6 +114,37 @@ class E2BEnvironmentConfig(BaseModel):
         return {k: v for k, v in params.items() if v is not None}
 
 
+#: Serialises builds per template name: without it, concurrent first builds of one image
+#: all see ``Template.exists() is False`` and all build the same alias, so every loser
+#: fails with ``409 ... resource conflict`` (measured: 4 threads → 3 losers, 8 → 7).
+_build_locks: dict[str, threading.RLock] = {}
+_build_locks_guard = threading.Lock()
+
+#: Template names already force-rebuilt in this process, so that ``skip_cache`` rebuilds
+#: once instead of once per instance sharing the image.
+_force_rebuilt: set[str] = set()
+
+
+def _build_lock(template_name: str) -> threading.RLock:
+    """Return the lock guarding builds of *template_name*.
+
+    Reentrant because :meth:`E2BTemplateManager.get_or_build` delegates to
+    :meth:`~E2BTemplateManager.rebuild`, which takes the same lock.
+    """
+    with _build_locks_guard:
+        return _build_locks.setdefault(template_name, threading.RLock())
+
+
+def _is_alias_conflict(e: Exception) -> bool:
+    """Return True for the error a *losing* concurrent first build gets.
+
+    Another builder claimed the alias first: ``409: template alias creation failed due
+    to resource conflict``. The build is lost but the template itself is on its way, so
+    the right response is to wait for it rather than to fail the run.
+    """
+    return re.match(r"\s*409\b", str(e)) is not None and "resource conflict" in str(e)
+
+
 class E2BTemplateManager:
     """Converts Docker images to E2B templates and manages their lifecycle.
 
@@ -109,11 +155,14 @@ class E2BTemplateManager:
     #: Config fields that change the built artifact and therefore the template identity.
     _BUILD_FIELDS = ("cpu_count", "memory_mb")
 
+    #: How long to wait for an asynchronous template deletion to land. Sub-second in practice.
+    _DELETE_TIMEOUT = 60
+
     def __init__(self, config: E2BEnvironmentConfig) -> None:
         self.config = config
         self.logger = logging.getLogger("minisweagent.environment.e2b")
 
-    def _template_name(self, docker_image: str) -> str:
+    def template_name(self, docker_image: str) -> str:
         """Deterministically map a Docker image name to a valid E2B template name.
 
         A sha256 8-character suffix is appended to avoid collisions between images
@@ -145,29 +194,170 @@ class E2BTemplateManager:
         return f"{prefix}-{hash_suffix}"
 
     def get_or_build(self, docker_image: str) -> str:
-        """Return the E2B template name for *docker_image*, building it if needed."""
+        """Return the E2B template name for *docker_image*, building it if needed.
+
+        The existence check happens *inside* the per-name lock: checking outside it is
+        the race itself, since every thread would then decide to build.
+        """
         from e2b import Template
 
-        template_name = self._template_name(docker_image)
-        if not Template.exists(template_name, **self.config.api_params()) or self.config.skip_cache:
-            self.logger.info(
-                "E2B template %s not found. Starting build (up to %d seconds)...",
-                template_name,
-                self.config.build_timeout,
-            )
-            self._build_template(docker_image, template_name)
-            self.logger.info("E2B template %s built successfully.", template_name)
-        else:
-            self.logger.debug("E2B template %s already exists.", template_name)
+        template_name = self.template_name(docker_image)
+        with _build_lock(template_name):
+            if self.config.skip_cache and template_name not in _force_rebuilt:
+                # Once per process: rebuilding on every construction would delete the
+                # template out from under the other instances sharing this image.
+                _force_rebuilt.add(template_name)
+                self.rebuild(docker_image)
+            elif not Template.exists(template_name, **self.config.api_params()):
+                self.logger.info(
+                    "E2B template %s not found. Starting build (up to %d seconds)...",
+                    template_name,
+                    self.config.build_timeout,
+                )
+                self._build_template(docker_image, template_name)
+                self.logger.info("E2B template %s built successfully.", template_name)
+            else:
+                self.logger.debug("E2B template %s already exists.", template_name)
         return template_name
 
     def rebuild(self, docker_image: str) -> str:
-        """Force-rebuild the E2B template for *docker_image*."""
-        template_name = self._template_name(docker_image)
-        self.logger.info("Rebuilding E2B template %s...", template_name)
-        self._build_template(docker_image, template_name)
-        self.logger.info("E2B template %s rebuilt successfully.", template_name)
+        """Force-rebuild the E2B template for *docker_image*.
+
+        Deletes it first because the control plane allows a single build per template:
+        building over an existing one fails with ``409: template build is not allowed in
+        current status ...``.
+        """
+        template_name = self.template_name(docker_image)
+        with _build_lock(template_name):
+            self.logger.info("Rebuilding E2B template %s...", template_name)
+            self._delete_template(template_name)
+            self._build_template(docker_image, template_name)
+            self.logger.info("E2B template %s rebuilt successfully.", template_name)
         return template_name
+
+    def repair(self, docker_image: str) -> str:
+        """Make the template for *docker_image* usable again, and return its name.
+
+        Rebuilds only what is actually broken, all of it under the build lock and
+        re-reading the status after acquiring it: without that, two callers that saw the
+        same failed template would both rebuild, and the second would delete what the
+        first had just built.
+
+        A build owned by someone else is waited for rather than deleted -- deleting it
+        would break that other runner.
+        """
+        from e2b.api.client.models import TemplateBuildStatus
+
+        template_name = self.template_name(docker_image)
+        with _build_lock(template_name):
+            status = self.template_status(template_name)
+            if status == TemplateBuildStatus.READY:
+                return template_name
+            if status in (TemplateBuildStatus.BUILDING, TemplateBuildStatus.WAITING):
+                self.logger.info("E2B template %s is being built elsewhere. Waiting...", template_name)
+                self.wait_until_ready(template_name)
+                return template_name
+            if status is None:
+                self.logger.info("E2B template %s not found. Building...", template_name)
+            else:
+                self.logger.warning("Rebuilding unusable E2B template %s (build status: %s)...", template_name, status)
+            self._delete_template(template_name)
+            self._build_template(docker_image, template_name)
+        return template_name
+
+    def template_status(self, template_name: str):
+        """Latest build status of *template_name*, or None if the template does not exist.
+
+        Two round trips, because ``Template.exists()`` cannot answer this: it only
+        resolves the alias, and the alias endpoint carries no status at all. That is why a
+        template whose build failed still reports as existing.
+        """
+        if (template_id := self._template_id(template_name)) is None:
+            return None
+        return self._build_status(template_id)
+
+    def wait_until_ready(self, template_name: str) -> None:
+        """Block until *template_name* is usable, for when another builder owns it.
+
+        The cross-process counterpart to the in-process build lock: a build started by a
+        different process cannot be serialised, so a loser waits it out instead.
+        """
+        from e2b.api.client.models import TemplateBuildStatus
+
+        if (template_id := self._template_id(template_name)) is None:
+            msg = f"E2B template {template_name} disappeared while waiting for its build"
+            raise RuntimeError(msg)
+        deadline = time.monotonic() + self.config.build_timeout
+        while (status := self._build_status(template_id)) in (
+            TemplateBuildStatus.BUILDING,
+            TemplateBuildStatus.WAITING,
+        ):
+            if time.monotonic() > deadline:
+                msg = f"E2B template {template_name} still {status} after {self.config.build_timeout}s"
+                raise TimeoutError(msg)
+            time.sleep(1)
+        if status != TemplateBuildStatus.READY:
+            msg = f"E2B template {template_name} did not become usable (build status: {status})"
+            raise RuntimeError(msg)
+
+    def _api_client(self):
+        """Low-level API client. The ``Template`` facade exposes no status or deletion."""
+        from e2b.api.client_sync import get_api_client
+        from e2b.connection_config import ConnectionConfig
+
+        return get_api_client(ConnectionConfig(**self.config.api_params()))
+
+    def _template_id(self, template_name: str) -> str | None:
+        """Resolve an alias to a template id, or None if the alias does not exist.
+
+        Only a 404 means "does not exist": treating every unreadable response that way
+        (a 403 from someone else's template, a 5xx) would send :meth:`repair` off to
+        delete and rebuild a template that is perfectly healthy.
+        """
+        from e2b.api import handle_api_exception
+        from e2b.api.client.api.templates import get_templates_aliases_alias
+
+        response = get_templates_aliases_alias.sync_detailed(alias=template_name, client=self._api_client())
+        if response.status_code == 404:
+            return None
+        if response.status_code >= 300:
+            raise handle_api_exception(response)
+        return response.parsed.template_id
+
+    def _build_status(self, template_id: str):
+        """Status of the template's most recent build, or None if it has none."""
+        from e2b.api import handle_api_exception
+        from e2b.api.client.api.templates import get_templates_template_id
+
+        response = get_templates_template_id.sync_detailed(template_id=template_id, client=self._api_client())
+        if response.status_code >= 300:
+            raise handle_api_exception(response)
+        if not (builds := response.parsed.builds):
+            return None
+        return max(builds, key=lambda build: build.created_at).status
+
+    def _delete_template(self, template_name: str) -> None:
+        """Delete *template_name* if it exists, and wait for the deletion to land.
+
+        Deletion is asynchronous: the API answers 204 while the template is still in
+        ``DELETING``, and building inside that window fails with ``409: template build is
+        not allowed in current status DELETING``. Convergence is sub-second in practice.
+        """
+        from e2b import Template
+        from e2b.api import handle_api_exception
+        from e2b.api.client.api.templates import delete_templates_template_id
+
+        if (template_id := self._template_id(template_name)) is None:
+            return
+        response = delete_templates_template_id.sync_detailed(template_id=template_id, client=self._api_client())
+        if response.status_code >= 300:
+            raise handle_api_exception(response)
+        deadline = time.monotonic() + self._DELETE_TIMEOUT
+        while Template.exists(template_name, **self.config.api_params()):
+            if time.monotonic() > deadline:
+                msg = f"E2B template {template_name} still exists {self._DELETE_TIMEOUT}s after deletion"
+                raise TimeoutError(msg)
+            time.sleep(0.5)
 
     def _build_template(self, docker_image: str, template_name: str) -> None:
         """Build an E2B template from *docker_image*.
@@ -192,6 +382,7 @@ class E2BTemplateManager:
                 memory_mb=self.config.memory_mb,
                 skip_cache=self.config.skip_cache,
                 tags=self.config.tags or None,
+                on_build_logs=self._on_build_log,
                 **self.config.api_params(),
             )
 
@@ -203,11 +394,18 @@ class E2BTemplateManager:
             executor.shutdown(wait=False, cancel_futures=True)
             msg = f"E2B template build timed out after {self.config.build_timeout}s: {template_name}"
             raise TimeoutError(msg) from e
-        except Exception:
+        except Exception as e:
             executor.shutdown(wait=False, cancel_futures=True)
-            raise
+            if not _is_alias_conflict(e):
+                raise
+            self.logger.info("E2B template %s is being built by someone else. Waiting...", template_name)
+            self.wait_until_ready(template_name)
         else:
             executor.shutdown(wait=True)
+
+    def _on_build_log(self, entry) -> None:
+        """Override to collect build logs: their tail is the only clue when an image cannot be pulled."""
+        self.logger.debug("E2B build: %s", getattr(entry, "message", entry))
 
 
 class E2BEnvironment:
@@ -230,17 +428,21 @@ class E2BEnvironment:
     _SECRET_FIELDS = {"api_key", "registry_password", "registry_username"}
 
     @staticmethod
-    def _is_stale_template_error(e: Exception) -> bool:
-        """Return True if *e* is a 'template not found' (HTTP 404) error.
+    def _is_recoverable_template_error(e: Exception) -> bool:
+        """Return True if *e* says the template is missing (404) or not usable yet (409).
 
-        e2b surfaces a missing template as a ``SandboxException`` whose message is
-        formatted as ``"{status_code}: {message}"`` (see ``e2b.api.handle_api_exception``).
-        Match the leading 404 status code rather than a bare ``"404"`` substring,
-        which could appear inside a sandbox id or path and trigger a costly,
-        unnecessary template rebuild.
+        e2b surfaces API errors as ``"{status_code}: {message}"`` (see
+        ``e2b.api.handle_api_exception``). Match the leading status code rather than a
+        bare substring, which could appear inside a sandbox id or path and trigger a
+        costly, unnecessary rebuild.
+
+        409 covers both ``template is CREATE_FAILED`` and a build still in flight. The
+        two need opposite responses, so :meth:`_recover_template` tells them apart -- but
+        both are recoverable, whereas treating 409 as fatal (as matching only 404 does)
+        leaves the image permanently unusable.
         """
         match = re.match(r"\s*(\d{3})\b", str(e))
-        return match is not None and match.group(1) == "404"
+        return match is not None and match.group(1) in ("404", "409")
 
     def __init__(
         self,
@@ -259,14 +461,29 @@ class E2BEnvironment:
         try:
             self.sandbox = self._create_sandbox()
         except SandboxException as e:
-            if not self._is_stale_template_error(e):
+            if not self._is_recoverable_template_error(e):
                 raise
-            self.logger.warning("Template %s not found (stale cache). Rebuilding...", self.template)
-            manager.rebuild(self.config.image)
+            self._recover_template(manager)
             self.sandbox = self._create_sandbox()
         self.logger.info("E2B sandbox ready (id: %s)", self.sandbox.sandbox_id)
         _active_sandboxes.add(self)
-        self._prepare_cwd()
+        try:
+            self._prepare_cwd()
+        except Exception:
+            self.cleanup()  # the sandbox is already running and billed by the second
+            raise
+
+    def _recover_template(self, manager: E2BTemplateManager) -> None:
+        """Make :attr:`template` usable again after ``Sandbox.create`` refused it.
+
+        A subclass may have resolved a pre-built template name instead of deriving one
+        from ``image``; rebuilding would then build a *different* name while the sandbox
+        keeps asking for this one, which looks like the repair did not work.
+        """
+        if not self.config.image or manager.template_name(self.config.image) != self.template:
+            msg = f"Template {self.template} cannot be repaired, because it was not derived from `image`"
+            raise RuntimeError(msg)
+        manager.repair(self.config.image)
 
     def _resolve_template(self, manager: E2BTemplateManager) -> str:
         """Override to reuse an already-built template instead of resolving one from the image."""
@@ -282,10 +499,13 @@ class E2BEnvironment:
             **self.config.api_params(),
         )
 
+    #: Echoed by the preparation command when ``cwd`` was not already in the image.
+    _CWD_MISSING_MARKER = "__MSWEA_CWD_MISSING__"
+
     def _prepare_cwd(self) -> None:
         """Make ``cwd`` usable, mirroring what ``docker run -w`` gives us for free.
 
-        Two things differ from a local container and both are silent-failure traps:
+        Three things differ from a local container and all three are silent-failure traps:
 
         1. ``docker run -w`` creates the working directory; a sandbox does not. A
            missing ``cwd`` fails at process spawn with no exit code attached, so
@@ -293,33 +513,64 @@ class E2BEnvironment:
         2. When the repository was created by a different uid than the one we run
            as, git refuses to touch it (``detected dubious ownership``), which
            breaks ``git diff`` and therefore the whole submission.
+        3. Creating the directory hides a misconfigured ``cwd`` completely: commands
+           then succeed in an empty directory and the agent submits an empty patch. So
+           report when the directory was not there to begin with, and let
+           ``require_existing_cwd`` turn that into an error.
 
-        Both commands are best-effort: in a prepared evaluation image the directory
-        already exists and may not be writable by an unprivileged user.
+        The first two commands are best-effort: in a prepared evaluation image the
+        directory already exists and may not be writable by an unprivileged user.
         """
+        quoted = shlex.quote(self.config.cwd)
+        was_missing = False
+        # The check shares a command with mkdir but stays in front of it, so that mkdir
+        # keeps supplying the exit code: a failing mkdir must still surface.
         for command in (
-            f"mkdir -p {shlex.quote(self.config.cwd)}",
-            f"git config --global --add safe.directory {shlex.quote(self.config.cwd)}",
+            f"test -d {quoted} || echo {self._CWD_MISSING_MARKER}; mkdir -p {quoted}",
+            f"git config --global --add safe.directory {quoted}",
         ):
             try:
-                self.sandbox.commands.run(command, user=self.config.run_as_user or None, timeout=30)
+                result = self.sandbox.commands.run(command, user=self.config.run_as_user or None, timeout=30)
+                stdout = result.stdout
             except Exception as e:
+                stdout = getattr(e, "stdout", "") or ""
                 self.logger.warning("Preparing cwd with %r failed: %s", command, e)
+            was_missing = was_missing or self._CWD_MISSING_MARKER in stdout
+        if not was_missing:
+            return
+        message = (
+            f"Working directory {self.config.cwd} was not in the image and has been created empty. "
+            "For a repository-based task this means it is misconfigured: commands will succeed in "
+            "the empty directory and the agent will submit an empty patch."
+        )
+        if self.config.require_existing_cwd:
+            raise RuntimeError(message)
+        self.logger.warning(message)
 
     def execute(self, action: dict, cwd: str = "", *, timeout: int | None = None) -> dict[str, Any]:
         """Execute a command in the sandbox and return the output."""
         import os
 
+        from e2b.exceptions import TimeoutException
+
         command = action.get("command", "") if isinstance(action, dict) else action
         envs = {k: os.environ[k] for k in self.config.forward_env if k in os.environ}
         envs.update(self.config.env)  # `env` wins over `forward_env`, as in DockerEnvironment
+        limit = timeout or self.config.timeout
+        # Collected while the command streams, because the SDK's timeout carries no output.
+        # Two buffers, stdout first: `_check_finished` only looks at the first line, and an
+        # interleaved stderr chunk would land in front of the submission sentinel.
+        stdout_chunks: list[str] = []
+        stderr_chunks: list[str] = []
         try:
             result = self.sandbox.commands.run(
                 shlex.join([*self.config.interpreter, command]) if self.config.interpreter else command,
                 user=self.config.run_as_user or None,
                 cwd=cwd or self.config.cwd,
-                timeout=timeout or self.config.timeout,
+                timeout=limit,
                 envs=envs or None,
+                on_stdout=stdout_chunks.append,
+                on_stderr=stderr_chunks.append,
             )
             output: dict[str, Any] = {
                 "output": result.stdout + result.stderr,
@@ -335,13 +586,27 @@ class E2BEnvironment:
                 output = {
                     "output": getattr(e, "stdout", "") + getattr(e, "stderr", ""),
                     "returncode": exit_code,
-                    "exception_info": "",
+                    # A negative exit code means the interpreter itself was killed by a
+                    # signal, and the SDK reports -1 for every signal, so 128+N cannot be
+                    # recovered. Leaving `exception_info` empty would claim this was an
+                    # ordinary command result. (A killed *child* is unaffected: the shell
+                    # survives and reports 137/143 as usual.)
+                    "exception_info": (
+                        ""
+                        if exit_code >= 0
+                        else "The process was terminated by a signal; the SDK does not report which one."
+                    ),
                 }
             else:
                 output = {
-                    "output": "",
+                    "output": "".join(stdout_chunks) + "".join(stderr_chunks),
                     "returncode": -1,
-                    "exception_info": f"An error occurred while executing the command: {e}",
+                    "exception_info": (
+                        f"The command timed out after {limit} seconds. Any output above is what it "
+                        "had produced by then."
+                        if isinstance(e, TimeoutException)
+                        else f"An error occurred while executing the command: {e}"
+                    ),
                     "extra": {"exception_type": type(e).__name__, "exception": str(e)},
                 }
         self._check_finished(output)
