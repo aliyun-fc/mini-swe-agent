@@ -25,7 +25,10 @@ The change set, spread over a few `feat(env):` commits:
 - `src/minisweagent/environments/extra/e2b.py` — new environment class.
 - `src/minisweagent/environments/__init__.py` — registers the `e2b` key.
 - `src/minisweagent/run/benchmarks/swebench.py` — per-instance image injection for `e2b`,
-  plus `_teardown_environment()` so the sandbox is released on every exit path.
+  plus `_teardown_environment()` so the sandbox is released on every exit path, and a
+  SIGTERM handler that raises `KeyboardInterrupt` so that a scheduler or CI timeout takes
+  the same path as `^C`: `atexit` does not run on SIGTERM, which otherwise leaves one
+  running -- and billed -- cloud sandbox per in-flight instance.
 - `pyproject.toml` — new `e2b` extra, also pulled into `full`.
 - Docs, `mkdocs.yml` nav, `README.md`, and tests for the above.
 
@@ -34,7 +37,7 @@ Nothing else is touched, so merging upstream `main` should stay mechanical.
 ### Deltas against PR 792
 
 The class follows PR 792 closely (same name, same `e2b` registry key, no
-vendor-specific fields) and adds seven things we hit while running this on real
+vendor-specific fields) and adds twelve things we hit while running this on real
 evaluation images. Each is generic — none of them mention any particular cloud:
 
 1. **`mkdir -p <cwd>` at startup.** `docker run -w` creates the working directory; a
@@ -60,6 +63,42 @@ evaluation images. Each is generic — none of them mention any particular cloud
    to be selected through process-global environment variables — unworkable when one
    process has to talk to two of them. A `_create_sandbox()` hook is also provided so
    subclasses can pass extra `Sandbox.create` options (metadata, network, volumes).
+8. **Template builds are serialised per template name, and a failed template can be
+   rebuilt.** `get_or_build()` checked `Template.exists()` outside any mutual exclusion, so
+   concurrent first builds of one image all decided to build the same alias: measured on
+   real infrastructure, 4 threads produced 3 losers and 8 threads produced 7, each failing
+   with `409 ... resource conflict` and leaving an orphan template record behind. Worse, the
+   failure was unrecoverable: the alias endpoint reports existence but carries no status, so
+   `exists()` keeps saying yes, while `Sandbox.create` refuses the template and a second
+   `Template.build` is rejected outright. Recovery now resolves the alias, deletes the
+   template and builds again — deletion is asynchronous, so it waits for the alias to
+   disappear before rebuilding. A build someone else has in flight is waited for rather
+   than deleted. `docker pull` is concurrency-safe and leaves no broken state, so this is a
+   gap against `DockerEnvironment` rather than a cloud quirk.
+9. **A timed-out command keeps the output it already produced.** PR 792 hard-codes
+   `"output": ""` on the generic exception path, and the SDK's timeout carries no
+   stdout/stderr at all, so everything printed before the deadline was lost — worst exactly
+   where it matters most, since a slow test suite on a large repository is what runs out of
+   time. Output is now collected through the streaming callbacks, and the timeout is named
+   in `exception_info` instead of being indistinguishable from an infrastructure failure.
+   `DockerEnvironment` salvages `TimeoutExpired.output` for the same reason.
+10. **A created working directory is reported.** Both `docker run -w` and step 1 above
+    create a missing `cwd` silently, which hides a misconfigured working directory
+    completely: commands succeed in the empty directory, and the agent runs to completion
+    and submits an empty patch. The directory is now probed before it is created, and
+    `require_existing_cwd` turns that into a hard failure for repository-based benchmarks.
+11. **The registry of live sandboxes holds weak references.** PR 792 keeps them in a plain
+    `set`, which holds every reference count above zero and therefore makes `__del__`
+    unreachable: an environment nobody holds on to any more keeps its sandbox running --
+    and billed -- until the process ends. Measured: three environments dropped, followed
+    by `gc.collect()`, left all three sandboxes alive. A `WeakSet` restores the finaliser
+    while `atexit` keeps covering the environments that are still alive.
+12. **A negative exit code is labelled as a signal.** The SDK reports `exit_code == -1` for
+    every signal, and -1 is also what this class returns for an infrastructure error, so an
+    empty `exception_info` would claim a killed interpreter was an ordinary command result.
+    The exit code is left alone -- 128+N cannot be recovered -- but it is now explained.
+    (The common case is unaffected: when a *child* is killed, the shell survives and
+    reports 137/143 as usual, so this only concerns the interpreter itself being killed.)
 
 Deliberately *not* carried over from our earlier private implementation, to keep the class
 minimal: a `request_timeout` passthrough (inert in current e2b SDKs — the command `timeout`
@@ -78,5 +117,5 @@ on `release: published` and would attempt a PyPI upload.
 ## When upstream merges #792
 
 1. Switch the documentation's pin to the upstream release that contains it.
-2. Re-propose our seven deltas upstream as separate, individually reviewable PRs.
+2. Re-propose our twelve deltas upstream as separate, individually reviewable PRs.
 3. Retire this fork.
