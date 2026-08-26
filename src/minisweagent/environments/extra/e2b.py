@@ -654,6 +654,13 @@ class E2BEnvironment:
 
     def cleanup(self) -> None:
         _active_sandboxes.discard(self)
+        # Kill once. `__del__` calls this again, and the object may survive until
+        # interpreter shutdown, where issuing another HTTP request crashes the SDK's
+        # native runtime -- correct output, exit code 139. Keep `self.sandbox`: callers
+        # still read `sandbox_id` after cleanup to reconcile a batch run.
+        if getattr(self, "_cleaned_up", False):
+            return
+        self._cleaned_up = True
         sandbox = getattr(self, "sandbox", None)
         if sandbox is not None:
             try:

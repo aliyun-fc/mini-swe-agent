@@ -446,6 +446,17 @@ class TestE2BEnvironmentCleanup:
         env.sandbox.kill.side_effect = RuntimeError("already dead")
         env.cleanup()  # must not raise
 
+    def test_cleanup_kills_only_once(self):
+        # `__del__` calls cleanup() again after an explicit one. Without this guard the
+        # second call issues another kill request, and when the object survives until
+        # interpreter shutdown -- as it does in any module-level script -- that request
+        # crashes the SDK's native runtime: correct output, exit code 139.
+        env = _make_env()
+        env.cleanup()
+        env.cleanup()
+        env.sandbox.kill.assert_called_once()
+        assert env.sandbox.sandbox_id  # batch reconciliation reads this after cleanup
+
 
 class TestAtexitCleanup:
     def test_cleanup_removes_from_active_sandboxes(self):
