@@ -7,6 +7,7 @@ import concurrent.futures
 import json
 import random
 import re
+import signal
 import threading
 import time
 import traceback
@@ -268,6 +269,18 @@ def main(
     config = recursive_merge(*configs)
 
     progress_manager = RunBatchProgressManager(len(instances), output_path / f"exit_statuses_{time.time()}.yaml")
+
+    def interrupt_on_sigterm(signum, frame):
+        """Take the same path as ^C, so that cloud sandboxes are released.
+
+        ``atexit`` does not run on SIGTERM, so a scheduler or a CI timeout would
+        otherwise leave one running -- and billed -- sandbox per in-flight instance.
+        Installed here rather than in the environment class: signals are process-wide and
+        only delivered to the main thread, so owning them belongs to the entry point.
+        """
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, interrupt_on_sigterm)
 
     def process_futures(futures: dict[concurrent.futures.Future, str]):
         for future in concurrent.futures.as_completed(futures):
