@@ -26,9 +26,13 @@ The change set, spread over a few `feat(env):` commits:
 - `src/minisweagent/environments/__init__.py` — registers the `e2b` key.
 - `src/minisweagent/run/benchmarks/swebench.py` — per-instance image injection for `e2b`,
   plus `_teardown_environment()` so the sandbox is released on every exit path, and a
-  SIGTERM handler that raises `KeyboardInterrupt` so that a scheduler or CI timeout takes
-  the same path as `^C`: `atexit` does not run on SIGTERM, which otherwise leaves one
-  running -- and billed -- cloud sandbox per in-flight instance.
+  bounded shutdown on SIGTERM. `atexit` does not run on SIGTERM, so a scheduler or CI
+  timeout would otherwise leave one running -- and billed -- cloud sandbox per in-flight
+  instance. Pending instances are cancelled, the running ones get
+  `MSWEA_SHUTDOWN_GRACE_SECONDS` (120s) to submit, and past that their environments are
+  released and the process exits 130. The deadline is the point: simply taking the `^C`
+  path waits for every running instance, so a scheduler that follows its own grace period
+  with SIGKILL still leaks their sandboxes.
 - `pyproject.toml` — new `e2b` extra, also pulled into `full`.
 - Docs, `mkdocs.yml` nav, `README.md`, and tests for the above.
 
@@ -42,7 +46,10 @@ evaluation images. Each is generic — none of them mention any particular cloud
 
 1. **`mkdir -p <cwd>` at startup.** `docker run -w` creates the working directory; a
    sandbox does not. The failure surfaces at process spawn *without* an exit code, so
-   `execute()` reports it as an infrastructure error on every single step.
+   `execute()` reports it as an infrastructure error on every single step. This one is not
+   best-effort: if the directory cannot be created -- an unprivileged `run_as_user`, say --
+   initialization stops, because otherwise every later command fails for a reason that has
+   nothing to do with the task.
 2. **`git config --global --add safe.directory <cwd>` at startup.** When the repository
    was created by a different uid than the one commands run as, git refuses it as
    dubiously owned, which breaks `git diff` and therefore the whole submission. Template
@@ -74,7 +81,13 @@ evaluation images. Each is generic — none of them mention any particular cloud
    template and builds again — deletion is asynchronous, so it waits for the alias to
    disappear before rebuilding. A build someone else has in flight is waited for rather
    than deleted. `docker pull` is concurrency-safe and leaves no broken state, so this is a
-   gap against `DockerEnvironment` rather than a cloud quirk.
+   gap against `DockerEnvironment` rather than a cloud quirk. Two details that only show up
+   under load: the build runs on a *daemon* thread, so `build_timeout` bounds the process
+   and not merely the wait -- a pooled worker cannot be cancelled once started and the
+   interpreter joins it on exit (measured: logic done at 1.0s, process at 8.2s) -- and the
+   once-per-process bookkeeping for `skip_cache` is recorded only after the rebuild lands,
+   keyed by control plane. The template name hashes just the image and its build
+   parameters, so a single shared key would rebuild on the first control plane only.
 9. **A timed-out command keeps the output it already produced.** PR 792 hard-codes
    `"output": ""` on the generic exception path, and the SDK's timeout carries no
    stdout/stderr at all, so everything printed before the deadline was lost — worst exactly
@@ -92,7 +105,13 @@ evaluation images. Each is generic — none of them mention any particular cloud
     unreachable: an environment nobody holds on to any more keeps its sandbox running --
     and billed -- until the process ends. Measured: three environments dropped, followed
     by `gc.collect()`, left all three sandboxes alive. A `WeakSet` restores the finaliser
-    while `atexit` keeps covering the environments that are still alive.
+    while `atexit` keeps covering the environments that are still alive. Restoring the
+    finaliser needs two things alongside it. `cleanup()` treats only a *returned* kill as
+    terminal -- an exception leaves the environment in the registry for `atexit` to retry,
+    since swallowing it would let one transient API error keep the sandbox billed until its
+    TTL. And `__del__` does nothing while `sys.is_finalizing()`: the SDK's native runtime is
+    already torn down by then, so a request from there ends the process with SIGSEGV --
+    correct output, exit code 139, which quietly breaks any `a.py && b.py` chain.
 12. **A negative exit code is labelled as a signal.** The SDK reports `exit_code == -1` for
     every signal, and -1 is also what this class returns for an infrastructure error, so an
     empty `exception_info` would claim a killed interpreter was an ordinary command result.
@@ -113,6 +132,13 @@ pip install "mini-swe-agent[e2b] @ git+https://github.com/aliyun-fc/mini-swe-age
 
 Tags only — **do not publish a GitHub Release**. `.github/workflows/release.yaml` triggers
 on `release: published` and would attempt a PyPI upload.
+
+The tag is cut after this branch merges, so until then pin the full commit SHA instead —
+anything mutable (a branch) makes an evaluation run unreproducible:
+
+```bash
+pip install "mini-swe-agent[e2b] @ git+https://github.com/aliyun-fc/mini-swe-agent@e3644c0384af6da13edafefa9872070e4ecc9509"
+```
 
 ## When upstream merges #792
 
