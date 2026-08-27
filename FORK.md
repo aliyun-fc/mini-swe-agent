@@ -133,11 +133,14 @@ pip install "mini-swe-agent[e2b] @ git+https://github.com/aliyun-fc/mini-swe-age
 Tags only — **do not publish a GitHub Release**. `.github/workflows/release.yaml` triggers
 on `release: published` and would attempt a PyPI upload.
 
-The tag is cut after this branch merges, so until then pin the full commit SHA instead —
-anything mutable (a branch) makes an evaluation run unreproducible:
+The tag is cut after this branch merges, so until then pin the full commit SHA of the
+branch head instead — anything mutable, a branch included, makes an evaluation run
+unreproducible. Naming a SHA in this file would be self-referential, so read it off the
+remote at the moment you pin:
 
 ```bash
-pip install "mini-swe-agent[e2b] @ git+https://github.com/aliyun-fc/mini-swe-agent@e3644c0384af6da13edafefa9872070e4ecc9509"
+git ls-remote https://github.com/aliyun-fc/mini-swe-agent fc/e2b-environment
+pip install "mini-swe-agent[e2b] @ git+https://github.com/aliyun-fc/mini-swe-agent@<that sha>"
 ```
 
 ## When upstream merges #792
