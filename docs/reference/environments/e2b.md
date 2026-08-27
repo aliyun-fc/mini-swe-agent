@@ -25,8 +25,16 @@ is paid once per unique image *and* resource spec.
 
 1. Install the dependencies:
    ```bash
-   pip install "mini-swe-agent[e2b]"
+   pip install "mini-swe-agent[e2b] @ git+https://github.com/aliyun-fc/mini-swe-agent@v2.4.6-fc.1"
    ```
+
+   This environment lives only in the
+   [aliyun-fc fork](https://github.com/aliyun-fc/mini-swe-agent), which is deliberately not
+   published to PyPI: a plain `pip install "mini-swe-agent[e2b]"` resolves to the upstream
+   distribution and leaves you without it. Pin the tag (see `FORK.md`) so a run stays
+   reproducible. The same implementation is proposed upstream in
+   [SWE-agent/mini-swe-agent#792](https://github.com/SWE-agent/mini-swe-agent/pull/792) --
+   once that lands, move the pin to the upstream release.
 
 2. Set your API key:
    ```bash

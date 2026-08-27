@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import atexit
-import concurrent.futures
 import hashlib
 import json
 import logging
 import re
 import shlex
+import sys
 import threading
 import time
 import weakref
@@ -122,7 +122,7 @@ _build_locks_guard = threading.Lock()
 
 #: Template names already force-rebuilt in this process, so that ``skip_cache`` rebuilds
 #: once instead of once per instance sharing the image.
-_force_rebuilt: set[str] = set()
+_force_rebuilt: set[tuple[str, str, str]] = set()
 
 
 def _build_lock(template_name: str) -> threading.RLock:
@@ -203,11 +203,12 @@ class E2BTemplateManager:
 
         template_name = self.template_name(docker_image)
         with _build_lock(template_name):
-            if self.config.skip_cache and template_name not in _force_rebuilt:
+            if self.config.skip_cache and self._rebuild_key(template_name) not in _force_rebuilt:
                 # Once per process: rebuilding on every construction would delete the
-                # template out from under the other instances sharing this image.
-                _force_rebuilt.add(template_name)
+                # template out from under the other instances sharing this image. Record
+                # it only after the rebuild lands, so a transient failure stays retryable.
                 self.rebuild(docker_image)
+                _force_rebuilt.add(self._rebuild_key(template_name))
             elif not Template.exists(template_name, **self.config.api_params()):
                 self.logger.info(
                     "E2B template %s not found. Starting build (up to %d seconds)...",
@@ -219,6 +220,16 @@ class E2BTemplateManager:
             else:
                 self.logger.debug("E2B template %s already exists.", template_name)
         return template_name
+
+    def _rebuild_key(self, template_name: str) -> tuple[str, str, str]:
+        """Key for the once-per-process rebuild registry.
+
+        The template name only hashes the image and its build parameters, so it repeats
+        across control planes. Without the account identity here, a process talking to
+        two of them would rebuild the image on the first one only.
+        """
+        params = self.config.api_params()
+        return (str(params.get("domain") or ""), str(params.get("api_url") or ""), template_name)
 
     def rebuild(self, docker_image: str) -> str:
         """Force-rebuild the E2B template for *docker_image*.
@@ -362,9 +373,11 @@ class E2BTemplateManager:
     def _build_template(self, docker_image: str, template_name: str) -> None:
         """Build an E2B template from *docker_image*.
 
-        Uses :class:`concurrent.futures.ThreadPoolExecutor` for timeout
-        enforcement because ``signal.alarm`` only works on the main thread
-        and this method may be called from worker threads.
+        Runs the build on a daemon thread rather than a pooled worker: ``build_timeout``
+        has to bound the *process*, and a pooled worker cannot be cancelled once started
+        -- the interpreter then joins it on exit, so a hung build delays shutdown by its
+        full remaining duration. Abandoning a daemon thread is safe here because the
+        template's real state lives on the control plane, where :meth:`repair` picks it up.
         """
         from e2b import Template
 
@@ -373,35 +386,37 @@ class E2BTemplateManager:
             username=self.config.registry_username,
             password=self.config.registry_password,
         )
+        failure: list[BaseException] = []
 
         def _do_build() -> None:
-            Template.build(
-                template,
-                template_name,
-                cpu_count=self.config.cpu_count,
-                memory_mb=self.config.memory_mb,
-                skip_cache=self.config.skip_cache,
-                tags=self.config.tags or None,
-                on_build_logs=self._on_build_log,
-                **self.config.api_params(),
-            )
+            try:
+                Template.build(
+                    template,
+                    template_name,
+                    cpu_count=self.config.cpu_count,
+                    memory_mb=self.config.memory_mb,
+                    skip_cache=self.config.skip_cache,
+                    tags=self.config.tags or None,
+                    on_build_logs=self._on_build_log,
+                    **self.config.api_params(),
+                )
+            except BaseException as e:  # noqa: BLE001 - re-raised on the calling thread
+                failure.append(e)
 
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        future = executor.submit(_do_build)
-        try:
-            future.result(timeout=self.config.build_timeout)
-        except concurrent.futures.TimeoutError as e:
-            executor.shutdown(wait=False, cancel_futures=True)
-            msg = f"E2B template build timed out after {self.config.build_timeout}s: {template_name}"
-            raise TimeoutError(msg) from e
-        except Exception as e:
-            executor.shutdown(wait=False, cancel_futures=True)
-            if not _is_alias_conflict(e):
-                raise
+        thread = threading.Thread(target=_do_build, name=f"e2b-build-{template_name}", daemon=True)
+        thread.start()
+        thread.join(timeout=self.config.build_timeout)
+        if thread.is_alive():
+            msg = (
+                f"E2B template build timed out after {self.config.build_timeout}s: {template_name} "
+                f"(control plane reports status {self.template_status(template_name)})"
+            )
+            raise TimeoutError(msg)
+        if failure:
+            if not _is_alias_conflict(failure[0]):
+                raise failure[0]
             self.logger.info("E2B template %s is being built by someone else. Waiting...", template_name)
             self.wait_until_ready(template_name)
-        else:
-            executor.shutdown(wait=True)
 
     def _on_build_log(self, entry) -> None:
         """Override to collect build logs: their tail is the only clue when an image cannot be pulled."""
@@ -517,26 +532,36 @@ class E2BEnvironment:
            then succeed in an empty directory and the agent submits an empty patch. So
            report when the directory was not there to begin with, and let
            ``require_existing_cwd`` turn that into an error.
-
-        The first two commands are best-effort: in a prepared evaluation image the
-        directory already exists and may not be writable by an unprivileged user.
         """
         quoted = shlex.quote(self.config.cwd)
-        was_missing = False
         # The check shares a command with mkdir but stays in front of it, so that mkdir
-        # keeps supplying the exit code: a failing mkdir must still surface.
-        for command in (
-            f"test -d {quoted} || echo {self._CWD_MISSING_MARKER}; mkdir -p {quoted}",
-            f"git config --global --add safe.directory {quoted}",
-        ):
-            try:
-                result = self.sandbox.commands.run(command, user=self.config.run_as_user or None, timeout=30)
-                stdout = result.stdout
-            except Exception as e:
-                stdout = getattr(e, "stdout", "") or ""
-                self.logger.warning("Preparing cwd with %r failed: %s", command, e)
-            was_missing = was_missing or self._CWD_MISSING_MARKER in stdout
-        if not was_missing:
+        # keeps supplying the exit code.
+        try:
+            result = self.sandbox.commands.run(
+                f"test -d {quoted} || echo {self._CWD_MISSING_MARKER}; mkdir -p {quoted}",
+                user=self.config.run_as_user or None,
+                timeout=30,
+            )
+            stdout = result.stdout
+        except Exception as e:
+            # Not best-effort: without the working directory every later command fails
+            # for a reason that has nothing to do with the task. An unprivileged
+            # `run_as_user` that cannot create it must stop initialization here.
+            msg = f"Could not create working directory {self.config.cwd}: {e}"
+            raise RuntimeError(msg) from e
+
+        # This one is best-effort: in a prepared evaluation image the repository is
+        # usually already owned by the user we run as.
+        try:
+            self.sandbox.commands.run(
+                f"git config --global --add safe.directory {quoted}",
+                user=self.config.run_as_user or None,
+                timeout=30,
+            )
+        except Exception as e:
+            self.logger.warning("Marking %s as a safe git directory failed: %s", self.config.cwd, e)
+
+        if self._CWD_MISSING_MARKER not in stdout:
             return
         message = (
             f"Working directory {self.config.cwd} was not in the image and has been created empty. "
@@ -653,20 +678,28 @@ class E2BEnvironment:
         }
 
     def cleanup(self) -> None:
-        _active_sandboxes.discard(self)
-        # Kill once. `__del__` calls this again, and the object may survive until
-        # interpreter shutdown, where issuing another HTTP request crashes the SDK's
-        # native runtime -- correct output, exit code 139. Keep `self.sandbox`: callers
-        # still read `sandbox_id` after cleanup to reconcile a batch run.
         if getattr(self, "_cleaned_up", False):
             return
-        self._cleaned_up = True
         sandbox = getattr(self, "sandbox", None)
         if sandbox is not None:
             try:
+                # True: killed. False: already gone. Both are terminal -- but an
+                # exception is not: swallowing it here would let one transient API
+                # error keep the sandbox billed until its TTL, because neither
+                # `atexit` nor `__del__` would try again.
                 sandbox.kill()
-            except Exception:
-                pass
+            except Exception as e:
+                self.logger.warning("Killing E2B sandbox %s failed, will retry: %s", sandbox.sandbox_id, e)
+                return
+        self._cleaned_up = True
+        # Keep `self.sandbox`: callers still read `sandbox_id` after cleanup to
+        # reconcile a batch run against the control plane.
+        _active_sandboxes.discard(self)
 
     def __del__(self) -> None:
+        # Never issue a request while the interpreter is tearing down: the SDK's native
+        # runtime is already gone by then and the process dies with SIGSEGV -- correct
+        # output, exit code 139. `atexit` runs before that point and covers this case.
+        if sys.is_finalizing():
+            return
         self.cleanup()

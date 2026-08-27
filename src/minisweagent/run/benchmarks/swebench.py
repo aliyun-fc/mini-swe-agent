@@ -3,11 +3,14 @@
 """Run mini-SWE-agent on SWE-bench instances in batch mode."""
 # Read this first: https://mini-swe-agent.com/latest/usage/swebench/  (usage docs)
 
+import atexit
 import concurrent.futures
 import json
+import os
 import random
 import re
 import signal
+import sys
 import threading
 import time
 import traceback
@@ -25,6 +28,11 @@ from minisweagent.run.benchmarks.utils.batch_progress import RunBatchProgressMan
 from minisweagent.run.benchmarks.utils.common import ProgressTrackingAgent
 from minisweagent.utils.log import add_file_handler, logger
 from minisweagent.utils.serialize import UNSET, recursive_merge
+
+#: How long a SIGTERM/^C shutdown lets the in-flight instances keep going before their
+#: environments are released and the process exits. Long enough for an agent to submit,
+#: short enough to land inside a scheduler's grace period before it sends SIGKILL.
+_SHUTDOWN_GRACE_SECONDS = int(os.getenv("MSWEA_SHUTDOWN_GRACE_SECONDS", "120"))
 
 _HELP_TEXT = """Run mini-SWE-agent on SWEBench instances.
 
@@ -293,6 +301,41 @@ def main(
                 logger.error(f"Error in future for instance {instance_id}: {e}", exc_info=True)
                 progress_manager.on_uncaught_exception(instance_id, e)
 
+    def shut_down(futures: dict[concurrent.futures.Future, str]):
+        """Let what can still finish do so, then release everything within a bounded time.
+
+        Waiting for the in-flight instances without a deadline is not safe under a
+        scheduler: it sends SIGTERM, waits its own grace period, then SIGKILLs -- and every
+        instance still holding a cloud sandbox leaves it running and billed. So give the
+        in-flight agents a window to submit, and hard-exit past it.
+        """
+        for future in futures:
+            if not future.running() and not future.done():
+                future.cancel()
+        try:
+            process_futures_until(futures, deadline=time.monotonic() + _SHUTDOWN_GRACE_SECONDS)
+        except TimeoutError:
+            logger.warning(
+                "Instances still running after %ss. Releasing their environments and exiting.",
+                _SHUTDOWN_GRACE_SECONDS,
+            )
+            # Run the exit hooks by hand: they are what releases the sandboxes, and
+            # os._exit skips them. Leaving through the executor's __exit__ instead would
+            # join every worker -- the unbounded wait we are trying to avoid.
+            atexit._run_exitfuncs()
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(130)
+
+    def process_futures_until(futures: dict[concurrent.futures.Future, str], deadline: float):
+        for future in concurrent.futures.as_completed(futures, timeout=max(0.0, deadline - time.monotonic())):
+            try:
+                future.result()
+            except (concurrent.futures.CancelledError, KeyboardInterrupt):
+                pass
+            except Exception as e:
+                logger.error(f"Error in future for instance {futures[future]}: {e}", exc_info=True)
+
     with Live(progress_manager.render_group, refresh_per_second=4):
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {
@@ -304,11 +347,10 @@ def main(
             try:
                 process_futures(futures)
             except KeyboardInterrupt:
-                logger.info("Cancelling all pending jobs. Press ^C again to exit immediately.")
-                for future in futures:
-                    if not future.running() and not future.done():
-                        future.cancel()
-                process_futures(futures)
+                logger.info(
+                    "Cancelling pending jobs, giving running ones %ss to finish.", _SHUTDOWN_GRACE_SECONDS
+                )
+                shut_down(futures)
 
 
 if __name__ == "__main__":

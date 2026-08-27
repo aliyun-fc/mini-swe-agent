@@ -129,6 +129,40 @@ class TestGetOrBuild:
             _make_manager().rebuild("swebench/test-image:latest")
         assert calls == ["delete", "build"]
 
+    def test_failed_forced_rebuild_stays_retryable(self):
+        # Recording the rebuild before it lands would make one transient failure
+        # permanent: every later instance would skip the rebuild and use the stale template.
+        from minisweagent.environments.extra import e2b as e2b_mod
+
+        manager = _make_manager(skip_cache=True)
+        attempts = []
+
+        def flaky_rebuild(docker_image):
+            attempts.append(docker_image)
+            if len(attempts) == 1:
+                raise RuntimeError("503")
+
+        e2b_mod._force_rebuilt.clear()
+        with patch.object(E2BTemplateManager, "rebuild", side_effect=flaky_rebuild):
+            with pytest.raises(RuntimeError, match="503"):
+                manager.get_or_build("swebench/test-image:latest")
+            manager.get_or_build("swebench/test-image:latest")
+        assert len(attempts) == 2
+        e2b_mod._force_rebuilt.clear()
+
+    def test_forced_rebuild_is_tracked_per_control_plane(self):
+        # The template name only hashes the image and its build parameters, so it repeats
+        # across control planes: one shared key would rebuild on the first domain only.
+        from minisweagent.environments.extra import e2b as e2b_mod
+
+        rebuilt = []
+        e2b_mod._force_rebuilt.clear()
+        with patch.object(E2BTemplateManager, "rebuild", side_effect=lambda image: rebuilt.append(image)):
+            for domain in ("one.example.com", "two.example.com"):
+                _make_manager(skip_cache=True, domain=domain).get_or_build("swebench/test-image:latest")
+        assert len(rebuilt) == 2
+        e2b_mod._force_rebuilt.clear()
+
 
 class TestRepair:
     def _manager(self, status, calls):
@@ -211,13 +245,22 @@ class TestPrepareCwd:
         env._prepare_cwd()
         assert "mkdir -p '/two words'" in env.sandbox.commands.run.call_args_list[0].args[0]
 
-    def test_tolerates_failure(self):
-        # In a prepared evaluation image the directory exists already and may not be
-        # writable by an unprivileged user -- that must not abort the run.
+    def test_unusable_cwd_aborts(self):
+        # Not best-effort: if the directory cannot be created, every later command fails
+        # for a reason unrelated to the task, so initialization must stop here.
         env = _make_env(cwd="/testbed")
         env.sandbox.commands.run.side_effect = RuntimeError("permission denied")
+        with pytest.raises(RuntimeError, match="Could not create working directory"):
+            env._prepare_cwd()
+
+    def test_git_config_failure_is_tolerated(self):
+        # In a prepared evaluation image the repository is usually already owned by the
+        # user we run as, so this one only matters when it is not -- warn and continue.
+        env = _make_env(cwd="/testbed")
+        self._mock_run(env)
+        env.sandbox.commands.run.side_effect = [env.sandbox.commands.run.return_value, RuntimeError("no git")]
         env._prepare_cwd()
-        assert env.sandbox.commands.run.call_count == 2
+        assert "safe git directory" in env.logger.warning.call_args.args[0]
 
     def test_existing_cwd_is_not_reported(self):
         env = _make_env(cwd="/testbed")
@@ -456,6 +499,22 @@ class TestE2BEnvironmentCleanup:
         env.cleanup()
         env.sandbox.kill.assert_called_once()
         assert env.sandbox.sandbox_id  # batch reconciliation reads this after cleanup
+
+    def test_cleanup_retries_after_a_failed_kill(self):
+        # Recording completion before the kill lands would let one transient API error
+        # keep the sandbox billed until its TTL: neither atexit nor __del__ would retry.
+        from minisweagent.environments.extra import e2b as e2b_mod
+
+        env = _make_env()
+        e2b_mod._active_sandboxes.add(env)
+        env.sandbox.kill.side_effect = [RuntimeError("503"), None]
+
+        env.cleanup()
+        assert env in e2b_mod._active_sandboxes
+
+        env.cleanup()
+        assert env.sandbox.kill.call_count == 2
+        assert env not in e2b_mod._active_sandboxes
 
 
 class TestAtexitCleanup:
