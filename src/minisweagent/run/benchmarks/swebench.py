@@ -113,6 +113,8 @@ def get_sb_environment(config: dict, instance: dict) -> Environment:
     image_name = get_swebench_docker_image_name(instance)
     if env_config["environment_class"] in ["docker", "swerex_modal", "e2b"]:
         env_config["image"] = image_name
+        if env_config["environment_class"] == "e2b":
+            env_config.setdefault("require_existing_cwd", True)
     elif env_config["environment_class"] in ["singularity", "contree"]:
         env_config["image"] = "docker://" + image_name
 
@@ -207,8 +209,11 @@ def _shutdown_active_environments(timeout: float = _SHUTDOWN_TIMEOUT) -> None:
             _ENVIRONMENT_REGISTRY.wait(remaining)
 
 
-def _release_and_exit(futures: dict[concurrent.futures.Future, str]) -> None:
+def _release_and_exit(futures: dict[concurrent.futures.Future, str], live: Live) -> None:
     """Cancel work, release active environments within their deadline, and hard-exit."""
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    live.stop()
     for future in futures:
         future.cancel()
     _shutdown_active_environments()
@@ -370,7 +375,7 @@ def main(
                 logger.error(f"Error in future for instance {instance_id}: {e}", exc_info=True)
                 progress_manager.on_uncaught_exception(instance_id, e)
 
-    with Live(progress_manager.render_group, refresh_per_second=4):
+    with Live(progress_manager.render_group, refresh_per_second=4) as live:
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {}
             try:
@@ -384,7 +389,7 @@ def main(
                     "re-run the same command to pick them up again.",
                     sum(1 for future in futures if future.running()),
                 )
-                _release_and_exit(futures)
+                _release_and_exit(futures, live)
 
 
 if __name__ == "__main__":

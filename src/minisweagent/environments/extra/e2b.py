@@ -15,6 +15,9 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+# Keep E2B SDK imports lazy: generic SWE-bench shutdown imports this module even
+# when the optional E2B dependency is not installed.
+
 #: Sandbox handles, rather than environments, are kept alive until a kill lands. This
 #: leaves dropped environments collectable while preserving the only object that can retry
 #: a failed kill. Every access is protected because worker cleanup and SIGTERM cleanup run
@@ -44,13 +47,11 @@ def _finish_sandbox_creation(sandbox=None) -> None:
         _sandbox_registry.notify_all()
 
 
-def _claim_sandbox(sandbox, *, register: bool = False) -> bool:
+def _claim_sandbox(sandbox) -> bool:
     with _sandbox_registry:
-        if sandbox not in _active_sandboxes:
-            if not register or sandbox in _killing_sandboxes:
-                return False
-            _active_sandboxes.add(sandbox)
-        _active_sandboxes.remove(sandbox)
+        if sandbox in _killing_sandboxes:
+            return False
+        _active_sandboxes.discard(sandbox)
         _killing_sandboxes.add(sandbox)
         return True
 
@@ -215,7 +216,7 @@ _build_locks_guard = threading.Lock()
 
 #: Template names already force-rebuilt in this process, so that ``skip_cache`` rebuilds
 #: once instead of once per instance sharing the image.
-_force_rebuilt: set[tuple[str, str, str]] = set()
+_force_rebuilt: set[tuple[str, str, str, str]] = set()
 
 
 def _build_lock(template_name: str) -> threading.RLock:
@@ -792,7 +793,7 @@ class E2BEnvironment:
                 return
             sandbox = getattr(self, "sandbox", None)
             if sandbox is not None:
-                if not _claim_sandbox(sandbox, register=True):
+                if not _claim_sandbox(sandbox):
                     return
                 try:
                     # True: killed. False: already gone. Both are terminal -- but an

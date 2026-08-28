@@ -1,6 +1,7 @@
 import json
 import re
-from unittest.mock import MagicMock, patch
+import signal
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 from pydantic import BaseModel
@@ -57,13 +58,17 @@ class TestTeardownEnvironment:
 def test_release_and_exit_cleans_all_environments_before_hard_exit():
     future = MagicMock()
     env = MagicMock(spec=["cleanup"])
+    live = MagicMock(spec=["stop"])
     _register_environment(env)
     with (
         patch("minisweagent.environments.extra.e2b.shutdown_active_sandboxes") as cleanup,
         patch("minisweagent.run.benchmarks.swebench.os._exit") as hard_exit,
+        patch("minisweagent.run.benchmarks.swebench.signal.signal") as set_signal,
     ):
-        _release_and_exit({future: "instance"})
+        _release_and_exit({future: "instance"}, live)
 
+    assert set_signal.call_args_list == [call(signal.SIGINT, signal.SIG_IGN), call(signal.SIGTERM, signal.SIG_IGN)]
+    live.stop.assert_called_once()
     future.cancel.assert_called_once()
     env.cleanup.assert_called_once()
     cleanup.assert_called_once()
@@ -183,6 +188,18 @@ def test_get_sb_environment_does_not_mutate_shared_config():
 
     assert mock_get_environment.call_args.args[0]["image"] == "custom/image:tag"
     assert "image" not in config["environment"]
+
+
+@pytest.mark.parametrize(("configured", "expected"), [(None, True), (False, False)])
+def test_get_sb_environment_requires_existing_cwd_for_e2b(configured, expected):
+    environment = {"environment_class": "e2b"}
+    if configured is not None:
+        environment["require_existing_cwd"] = configured
+
+    with patch("minisweagent.run.benchmarks.swebench.get_environment", return_value=MagicMock()) as create:
+        get_sb_environment({"environment": environment}, {"instance_id": "repo__test"})
+
+    assert create.call_args.args[0]["require_existing_cwd"] is expected
 
 
 def test_filter_instances_no_filters():

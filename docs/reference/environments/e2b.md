@@ -57,6 +57,7 @@ Or in a YAML config:
 environment:
   environment_class: e2b
   cwd: /testbed
+  require_existing_cwd: true
   sandbox_timeout: 3600
   cpu_count: 2
   memory_mb: 8192
