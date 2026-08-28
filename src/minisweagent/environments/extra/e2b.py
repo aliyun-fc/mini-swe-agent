@@ -24,11 +24,22 @@ from pydantic import BaseModel, Field
 #: environments, ``atexit`` releases the ones still alive.
 _active_sandboxes: weakref.WeakSet[E2BEnvironment] = weakref.WeakSet()
 
+#: Sandboxes whose kill did not land, kept by handle rather than by environment. Coming in from
+#: ``__del__`` the environment is already being finalised, so leaving it in the weak registry buys
+#: nothing: the entry disappears as soon as ``__del__`` returns and ``atexit`` never sees it.
+_pending_kills: set = set()
+
 
 def _cleanup_all_sandboxes() -> None:
     """Kill all sandboxes that are still alive at interpreter shutdown."""
     for env in list(_active_sandboxes):
         env.cleanup()
+    for sandbox in list(_pending_kills):
+        try:
+            sandbox.kill()
+        except Exception:
+            pass
+        _pending_kills.discard(sandbox)
 
 
 atexit.register(_cleanup_all_sandboxes)
@@ -221,15 +232,17 @@ class E2BTemplateManager:
                 self.logger.debug("E2B template %s already exists.", template_name)
         return template_name
 
-    def _rebuild_key(self, template_name: str) -> tuple[str, str, str]:
+    def _rebuild_key(self, template_name: str) -> tuple[str, str, str, str]:
         """Key for the once-per-process rebuild registry.
 
-        The template name only hashes the image and its build parameters, so it repeats
-        across control planes. Without the account identity here, a process talking to
-        two of them would rebuild the image on the first one only.
+        The template name only hashes the image and its build parameters, so it repeats across
+        accounts. Without the identity here, a process talking to two of them would rebuild the
+        image on the first one only. The key is hashed rather than stored: this set lives at
+        module scope and must not hold a credential.
         """
         params = self.config.api_params()
-        return (str(params.get("domain") or ""), str(params.get("api_url") or ""), template_name)
+        account = hashlib.sha256(str(params.get("api_key") or "").encode()).hexdigest()[:12]
+        return (str(params.get("domain") or ""), str(params.get("api_url") or ""), account, template_name)
 
     def rebuild(self, docker_image: str) -> str:
         """Force-rebuild the E2B template for *docker_image*.
@@ -407,10 +420,10 @@ class E2BTemplateManager:
         thread.start()
         thread.join(timeout=self.config.build_timeout)
         if thread.is_alive():
-            msg = (
-                f"E2B template build timed out after {self.config.build_timeout}s: {template_name} "
-                f"(control plane reports status {self.template_status(template_name)})"
-            )
+            # No status query here: it is another network round trip past the deadline, which
+            # would stop `build_timeout` from being a bound. `repair()` resolves the real state
+            # when the caller retries.
+            msg = f"E2B template build timed out after {self.config.build_timeout}s: {template_name}"
             raise TimeoutError(msg)
         if failure:
             if not _is_alias_conflict(failure[0]):
@@ -685,12 +698,15 @@ class E2BEnvironment:
             try:
                 # True: killed. False: already gone. Both are terminal -- but an
                 # exception is not: swallowing it here would let one transient API
-                # error keep the sandbox billed until its TTL, because neither
-                # `atexit` nor `__del__` would try again.
+                # error keep the sandbox billed until its TTL.
                 sandbox.kill()
             except Exception as e:
+                # Park the handle, not the environment: coming in from `__del__` this object
+                # is already being finalised and cannot be kept alive to retry.
+                _pending_kills.add(sandbox)
                 self.logger.warning("Killing E2B sandbox %s failed, will retry: %s", sandbox.sandbox_id, e)
                 return
+            _pending_kills.discard(sandbox)
         self._cleaned_up = True
         # Keep `self.sandbox`: callers still read `sandbox_id` after cleanup to
         # reconcile a batch run against the control plane.

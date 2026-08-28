@@ -18,6 +18,24 @@ from minisweagent.environments.extra.e2b import (
 from minisweagent.exceptions import Submitted
 
 
+class _SilentLogger:
+    """A logger that keeps nothing, for tests that exercise `__del__`.
+
+    A MagicMock records its call arguments, and an exception among them holds the frame that
+    raised it -- and therefore the environment -- alive, resurrecting an object that should have
+    been collected.
+    """
+
+    def warning(self, *args, **kwargs) -> None:
+        pass
+
+    def info(self, *args, **kwargs) -> None:
+        pass
+
+    def debug(self, *args, **kwargs) -> None:
+        pass
+
+
 def _make_env(**kwargs) -> E2BEnvironment:
     """Create an E2BEnvironment without touching real E2B infrastructure."""
     with patch.object(E2BEnvironment, "__init__", lambda self, **kw: None):
@@ -150,16 +168,24 @@ class TestGetOrBuild:
         assert len(attempts) == 2
         e2b_mod._force_rebuilt.clear()
 
-    def test_forced_rebuild_is_tracked_per_control_plane(self):
-        # The template name only hashes the image and its build parameters, so it repeats
-        # across control planes: one shared key would rebuild on the first domain only.
+    @pytest.mark.parametrize(
+        ("field", "values"),
+        [
+            ("domain", ("one.example.com", "two.example.com")),
+            ("api_key", ("e2b_account_one", "e2b_account_two")),
+        ],
+    )
+    def test_forced_rebuild_is_tracked_per_account(self, field, values):
+        # The template name only hashes the image and its build parameters, so it repeats across
+        # accounts: one shared key would rebuild on the first of them only. Two accounts on the
+        # same domain have separate template namespaces just as two domains do.
         from minisweagent.environments.extra import e2b as e2b_mod
 
         rebuilt = []
         e2b_mod._force_rebuilt.clear()
         with patch.object(E2BTemplateManager, "rebuild", side_effect=lambda image: rebuilt.append(image)):
-            for domain in ("one.example.com", "two.example.com"):
-                _make_manager(skip_cache=True, domain=domain).get_or_build("swebench/test-image:latest")
+            for value in values:
+                _make_manager(skip_cache=True, **{field: value}).get_or_build("swebench/test-image:latest")
         assert len(rebuilt) == 2
         e2b_mod._force_rebuilt.clear()
 
@@ -501,8 +527,8 @@ class TestE2BEnvironmentCleanup:
         assert env.sandbox.sandbox_id  # batch reconciliation reads this after cleanup
 
     def test_cleanup_retries_after_a_failed_kill(self):
-        # Recording completion before the kill lands would let one transient API error
-        # keep the sandbox billed until its TTL: neither atexit nor __del__ would retry.
+        # Recording completion before the kill lands would let one transient API error keep the
+        # sandbox billed until its TTL: neither atexit nor __del__ would retry.
         from minisweagent.environments.extra import e2b as e2b_mod
 
         env = _make_env()
@@ -515,6 +541,38 @@ class TestE2BEnvironmentCleanup:
         env.cleanup()
         assert env.sandbox.kill.call_count == 2
         assert env not in e2b_mod._active_sandboxes
+
+    def test_failed_kill_from_del_is_retried_at_exit(self):
+        # The path that actually leaks: `__del__` runs, the kill fails, and the environment is
+        # gone a moment later -- so keeping it in the weak registry buys nothing and `atexit`
+        # never sees it. Measured before the fix: one kill attempt, registry empty, no retry.
+        # The exception is raised fresh and the logger keeps nothing: a retained traceback would
+        # hold a reference to the environment through its frame and resurrect it, which makes
+        # this test pass for the wrong reason.
+        from minisweagent.environments.extra import e2b as e2b_mod
+
+        attempts = []
+
+        def flaky_kill():
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise RuntimeError("503")
+
+        env = _make_env()
+        sandbox = env.sandbox
+        sandbox.kill = flaky_kill
+        env.logger = _SilentLogger()
+        e2b_mod._active_sandboxes.add(env)
+
+        del env
+        gc.collect()
+
+        assert attempts == [1]
+        assert sandbox in e2b_mod._pending_kills
+
+        e2b_mod._cleanup_all_sandboxes()
+        assert len(attempts) == 2
+        assert sandbox not in e2b_mod._pending_kills
 
 
 class TestAtexitCleanup:

@@ -29,11 +29,6 @@ from minisweagent.run.benchmarks.utils.common import ProgressTrackingAgent
 from minisweagent.utils.log import add_file_handler, logger
 from minisweagent.utils.serialize import UNSET, recursive_merge
 
-#: How long a SIGTERM/^C shutdown lets the in-flight instances keep going before their
-#: environments are released and the process exits. Long enough for an agent to submit,
-#: short enough to land inside a scheduler's grace period before it sends SIGKILL.
-_SHUTDOWN_GRACE_SECONDS = int(os.getenv("MSWEA_SHUTDOWN_GRACE_SECONDS", "120"))
-
 _HELP_TEXT = """Run mini-SWE-agent on SWEBench instances.
 
 [not dim]
@@ -301,40 +296,28 @@ def main(
                 logger.error(f"Error in future for instance {instance_id}: {e}", exc_info=True)
                 progress_manager.on_uncaught_exception(instance_id, e)
 
-    def shut_down(futures: dict[concurrent.futures.Future, str]):
-        """Let what can still finish do so, then release everything within a bounded time.
+    def release_and_exit(futures: dict[concurrent.futures.Future, str]):
+        """Cancel everything, release every sandbox, and leave immediately.
 
-        Waiting for the in-flight instances without a deadline is not safe under a
-        scheduler: it sends SIGTERM, waits its own grace period, then SIGKILLs -- and every
-        instance still holding a cloud sandbox leaves it running and billed. So give the
-        in-flight agents a window to submit, and hard-exit past it.
+        Deliberately without a grace period. A scheduler sends SIGTERM, waits its own window
+        and then SIGKILLs -- Kubernetes defaults to 30s, less than a single agent step on a
+        large repository -- so waiting for the in-flight instances first risks never sending
+        the kill requests at all.
+
+        Their work is dropped, trajectory included: in batch mode the trajectory is written
+        once, by this function's caller, and a hard exit skips it. What survives is
+        `preds.json`, written per instance as each one finishes, so re-running the same command
+        picks up exactly the instances that never got there. The cost is the model spend on
+        them; what it buys is a cloud sandbox not left billing by the second.
         """
         for future in futures:
-            if not future.running() and not future.done():
-                future.cancel()
-        try:
-            process_futures_until(futures, deadline=time.monotonic() + _SHUTDOWN_GRACE_SECONDS)
-        except TimeoutError:
-            logger.warning(
-                "Instances still running after %ss. Releasing their environments and exiting.",
-                _SHUTDOWN_GRACE_SECONDS,
-            )
-            # Run the exit hooks by hand: they are what releases the sandboxes, and
-            # os._exit skips them. Leaving through the executor's __exit__ instead would
-            # join every worker -- the unbounded wait we are trying to avoid.
-            atexit._run_exitfuncs()
-            sys.stdout.flush()
-            sys.stderr.flush()
-            os._exit(130)
-
-    def process_futures_until(futures: dict[concurrent.futures.Future, str], deadline: float):
-        for future in concurrent.futures.as_completed(futures, timeout=max(0.0, deadline - time.monotonic())):
-            try:
-                future.result()
-            except (concurrent.futures.CancelledError, KeyboardInterrupt):
-                pass
-            except Exception as e:
-                logger.error(f"Error in future for instance {futures[future]}: {e}", exc_info=True)
+            future.cancel()
+        # Run the exit hooks by hand: they are what releases the sandboxes, and os._exit skips
+        # them. Leaving through the executor's __exit__ instead would join every worker.
+        atexit._run_exitfuncs()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(130)
 
     with Live(progress_manager.render_group, refresh_per_second=4):
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
@@ -348,9 +331,11 @@ def main(
                 process_futures(futures)
             except KeyboardInterrupt:
                 logger.info(
-                    "Cancelling pending jobs, giving running ones %ss to finish.", _SHUTDOWN_GRACE_SECONDS
+                    "Interrupted. Dropping %d in-flight instances and releasing their sandboxes; "
+                    "re-run the same command to pick them up again.",
+                    sum(1 for future in futures if future.running()),
                 )
-                shut_down(futures)
+                release_and_exit(futures)
 
 
 if __name__ == "__main__":
