@@ -8,6 +8,7 @@ from pydantic import BaseModel
 from minisweagent import package_dir
 from minisweagent.models.test_models import DeterministicModel, make_output
 from minisweagent.run.benchmarks.swebench import (
+    _release_and_exit,
     _teardown_environment,
     filter_instances,
     get_sb_environment,
@@ -35,6 +36,19 @@ class TestTeardownEnvironment:
 
     def test_tolerates_none(self):
         _teardown_environment(None)  # must not raise
+
+
+def test_release_and_exit_cleans_only_e2b_before_hard_exit():
+    future = MagicMock()
+    with (
+        patch("minisweagent.environments.extra.e2b.shutdown_active_sandboxes") as cleanup,
+        patch("minisweagent.run.benchmarks.swebench.os._exit") as hard_exit,
+    ):
+        _release_and_exit({future: "instance"})
+
+    future.cancel.assert_called_once()
+    cleanup.assert_called_once()
+    hard_exit.assert_called_once_with(130)
 
 
 def _make_model_from_fixture(text_outputs: list[str], cost_per_call: float = 1.0, **kwargs) -> DeterministicModel:

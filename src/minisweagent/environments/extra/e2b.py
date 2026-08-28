@@ -11,38 +11,120 @@ import shlex
 import sys
 import threading
 import time
-import weakref
 from typing import Any
 
 from pydantic import BaseModel, Field
 
-#: Live sandboxes, for best-effort cleanup at exit (covers Ctrl+C and unhandled
-#: exceptions). Weak so that an environment nobody holds on to any more stays
-#: collectable: a strong registry keeps every reference count above zero, which makes
-#: ``__del__`` unreachable and leaves such a sandbox running -- and billed -- until the
-#: process ends. The two paths are complementary: garbage collection releases dropped
-#: environments, ``atexit`` releases the ones still alive.
-_active_sandboxes: weakref.WeakSet[E2BEnvironment] = weakref.WeakSet()
-
-#: Sandboxes whose kill did not land, kept by handle rather than by environment. Coming in from
-#: ``__del__`` the environment is already being finalised, so leaving it in the weak registry buys
-#: nothing: the entry disappears as soon as ``__del__`` returns and ``atexit`` never sees it.
-_pending_kills: set = set()
+#: Sandbox handles, rather than environments, are kept alive until a kill lands. This
+#: leaves dropped environments collectable while preserving the only object that can retry
+#: a failed kill. Every access is protected because worker cleanup and SIGTERM cleanup run
+#: concurrently.
+_active_sandboxes: set[Any] = set()
+_killing_sandboxes: set[Any] = set()
+_sandbox_registry = threading.Condition()
+_creating_sandboxes = 0
+_shutting_down = False
+_CLEANUP_TIMEOUT = 20.0
 
 
-def _cleanup_all_sandboxes() -> None:
-    """Kill all sandboxes that are still alive at interpreter shutdown."""
-    for env in list(_active_sandboxes):
-        env.cleanup()
-    for sandbox in list(_pending_kills):
+def _begin_sandbox_creation() -> None:
+    global _creating_sandboxes
+    with _sandbox_registry:
+        if _shutting_down:
+            raise RuntimeError("Cannot create an E2B sandbox while shutdown is in progress")
+        _creating_sandboxes += 1
+
+
+def _finish_sandbox_creation(sandbox=None) -> None:
+    global _creating_sandboxes
+    with _sandbox_registry:
+        if sandbox is not None:
+            _active_sandboxes.add(sandbox)
+        _creating_sandboxes -= 1
+        _sandbox_registry.notify_all()
+
+
+def _claim_sandbox(sandbox, *, register: bool = False) -> bool:
+    with _sandbox_registry:
+        if sandbox not in _active_sandboxes:
+            if not register or sandbox in _killing_sandboxes:
+                return False
+            _active_sandboxes.add(sandbox)
+        _active_sandboxes.remove(sandbox)
+        _killing_sandboxes.add(sandbox)
+        return True
+
+
+def _finish_sandbox_kill(sandbox, success: bool) -> None:
+    with _sandbox_registry:
+        _killing_sandboxes.discard(sandbox)
+        if not success:
+            _active_sandboxes.add(sandbox)
+        _sandbox_registry.notify_all()
+
+
+def _kill_for_shutdown(sandbox, deadline: float) -> None:
+    """Make one deadline-bound kill attempt, even if worker cleanup is already stuck."""
+    owned = False
+    try:
+        with _sandbox_registry:
+            if sandbox in _active_sandboxes:
+                _active_sandboxes.remove(sandbox)
+                _killing_sandboxes.add(sandbox)
+                owned = True
+            elif sandbox not in _killing_sandboxes:
+                return
+        if (remaining := deadline - time.monotonic()) <= 0:
+            if owned:
+                _finish_sandbox_kill(sandbox, False)
+            return
         try:
-            sandbox.kill()
+            sandbox.kill(request_timeout=remaining)
         except Exception:
-            pass
-        _pending_kills.discard(sandbox)
+            if owned:
+                _finish_sandbox_kill(sandbox, False)
+        else:
+            if owned:
+                _finish_sandbox_kill(sandbox, True)
+    finally:
+        with _sandbox_registry:
+            _sandbox_registry.notify_all()
 
 
-atexit.register(_cleanup_all_sandboxes)
+def shutdown_active_sandboxes(timeout: float = _CLEANUP_TIMEOUT) -> None:
+    """Concurrently kill registered sandboxes within one process-wide deadline."""
+    global _shutting_down
+    deadline = time.monotonic() + timeout
+    attempted: set[Any] = set()
+    workers: list[threading.Thread] = []
+    with _sandbox_registry:
+        _shutting_down = True
+
+    while True:
+        with _sandbox_registry:
+            sandboxes = list((_active_sandboxes | _killing_sandboxes) - attempted)
+            attempted.update(sandboxes)
+        for sandbox in sandboxes:
+            worker = threading.Thread(
+                target=_kill_for_shutdown,
+                args=(sandbox, deadline),
+                name=f"e2b-kill-{getattr(sandbox, 'sandbox_id', 'unknown')}",
+                daemon=True,
+            )
+            workers.append(worker)
+            worker.start()
+
+        with _sandbox_registry:
+            unfinished = any(worker.is_alive() for worker in workers)
+            unclaimed = bool((_active_sandboxes | _killing_sandboxes) - attempted)
+            if not unfinished and not unclaimed and _creating_sandboxes == 0:
+                return
+            if (remaining := deadline - time.monotonic()) <= 0:
+                return
+            _sandbox_registry.wait(remaining)
+
+
+atexit.register(shutdown_active_sandboxes)
 
 
 class E2BEnvironmentConfig(BaseModel):
@@ -240,9 +322,11 @@ class E2BTemplateManager:
         image on the first one only. The key is hashed rather than stored: this set lives at
         module scope and must not hold a credential.
         """
-        params = self.config.api_params()
-        account = hashlib.sha256(str(params.get("api_key") or "").encode()).hexdigest()[:12]
-        return (str(params.get("domain") or ""), str(params.get("api_url") or ""), account, template_name)
+        from e2b import ConnectionConfig
+
+        connection = ConnectionConfig(**self.config.api_params())
+        account = hashlib.sha256(str(connection.api_key or "").encode()).hexdigest()[:12]
+        return (connection.domain, connection.api_url, account, template_name)
 
     def rebuild(self, docker_image: str) -> str:
         """Force-rebuild the E2B template for *docker_image*.
@@ -483,23 +567,33 @@ class E2BEnvironment:
 
         self.logger = logger or logging.getLogger("minisweagent.environment.e2b")
         self.config = config_class(**kwargs)
+        self._cleanup_lock = threading.Lock()
         manager = E2BTemplateManager(self.config)
         self.template = self._resolve_template(manager)
         self.logger.info("Creating E2B sandbox (template: %s)...", self.template)
         try:
-            self.sandbox = self._create_sandbox()
+            self.sandbox = self._create_registered_sandbox()
         except SandboxException as e:
             if not self._is_recoverable_template_error(e):
                 raise
             self._recover_template(manager)
-            self.sandbox = self._create_sandbox()
+            self.sandbox = self._create_registered_sandbox()
         self.logger.info("E2B sandbox ready (id: %s)", self.sandbox.sandbox_id)
-        _active_sandboxes.add(self)
         try:
             self._prepare_cwd()
         except Exception:
             self.cleanup()  # the sandbox is already running and billed by the second
             raise
+
+    def _create_registered_sandbox(self):
+        """Create a sandbox while making shutdown wait for and register the result."""
+        _begin_sandbox_creation()
+        sandbox = None
+        try:
+            sandbox = self._create_sandbox()
+            return sandbox
+        finally:
+            _finish_sandbox_creation(sandbox)
 
     def _recover_template(self, manager: E2BTemplateManager) -> None:
         """Make :attr:`template` usable again after ``Sandbox.create`` refused it.
@@ -691,26 +785,27 @@ class E2BEnvironment:
         }
 
     def cleanup(self) -> None:
-        if getattr(self, "_cleaned_up", False):
-            return
-        sandbox = getattr(self, "sandbox", None)
-        if sandbox is not None:
-            try:
-                # True: killed. False: already gone. Both are terminal -- but an
-                # exception is not: swallowing it here would let one transient API
-                # error keep the sandbox billed until its TTL.
-                sandbox.kill()
-            except Exception as e:
-                # Park the handle, not the environment: coming in from `__del__` this object
-                # is already being finalised and cannot be kept alive to retry.
-                _pending_kills.add(sandbox)
-                self.logger.warning("Killing E2B sandbox %s failed, will retry: %s", sandbox.sandbox_id, e)
+        if not hasattr(self, "_cleanup_lock"):
+            self._cleanup_lock = threading.Lock()
+        with self._cleanup_lock:
+            if getattr(self, "_cleaned_up", False):
                 return
-            _pending_kills.discard(sandbox)
-        self._cleaned_up = True
-        # Keep `self.sandbox`: callers still read `sandbox_id` after cleanup to
-        # reconcile a batch run against the control plane.
-        _active_sandboxes.discard(self)
+            sandbox = getattr(self, "sandbox", None)
+            if sandbox is not None:
+                if not _claim_sandbox(sandbox, register=True):
+                    return
+                try:
+                    # True: killed. False: already gone. Both are terminal -- but an
+                    # exception is not: the registered handle stays available for retry.
+                    sandbox.kill()
+                except Exception as e:
+                    _finish_sandbox_kill(sandbox, False)
+                    self.logger.warning("Killing E2B sandbox %s failed, will retry: %s", sandbox.sandbox_id, e)
+                    return
+                _finish_sandbox_kill(sandbox, True)
+            self._cleaned_up = True
+            # Keep `self.sandbox`: callers still read `sandbox_id` after cleanup to
+            # reconcile a batch run against the control plane.
 
     def __del__(self) -> None:
         # Never issue a request while the interpreter is tearing down: the SDK's native

@@ -3,7 +3,6 @@
 """Run mini-SWE-agent on SWE-bench instances in batch mode."""
 # Read this first: https://mini-swe-agent.com/latest/usage/swebench/  (usage docs)
 
-import atexit
 import concurrent.futures
 import json
 import os
@@ -141,6 +140,18 @@ def _teardown_environment(env: Environment | None) -> None:
         if callable(teardown := getattr(env, teardown_name, None)):
             teardown()
             break
+
+
+def _release_and_exit(futures: dict[concurrent.futures.Future, str]) -> None:
+    """Cancel work, release E2B sandboxes within their deadline, and hard-exit."""
+    from minisweagent.environments.extra.e2b import shutdown_active_sandboxes
+
+    for future in futures:
+        future.cancel()
+    shutdown_active_sandboxes()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(130)
 
 
 def process_instance(
@@ -296,29 +307,6 @@ def main(
                 logger.error(f"Error in future for instance {instance_id}: {e}", exc_info=True)
                 progress_manager.on_uncaught_exception(instance_id, e)
 
-    def release_and_exit(futures: dict[concurrent.futures.Future, str]):
-        """Cancel everything, release every sandbox, and leave immediately.
-
-        Deliberately without a grace period. A scheduler sends SIGTERM, waits its own window
-        and then SIGKILLs -- Kubernetes defaults to 30s, less than a single agent step on a
-        large repository -- so waiting for the in-flight instances first risks never sending
-        the kill requests at all.
-
-        Their work is dropped, trajectory included: in batch mode the trajectory is written
-        once, by this function's caller, and a hard exit skips it. What survives is
-        `preds.json`, written per instance as each one finishes, so re-running the same command
-        picks up exactly the instances that never got there. The cost is the model spend on
-        them; what it buys is a cloud sandbox not left billing by the second.
-        """
-        for future in futures:
-            future.cancel()
-        # Run the exit hooks by hand: they are what releases the sandboxes, and os._exit skips
-        # them. Leaving through the executor's __exit__ instead would join every worker.
-        atexit._run_exitfuncs()
-        sys.stdout.flush()
-        sys.stderr.flush()
-        os._exit(130)
-
     with Live(progress_manager.render_group, refresh_per_second=4):
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {
@@ -335,7 +323,7 @@ def main(
                     "re-run the same command to pick them up again.",
                     sum(1 for future in futures if future.running()),
                 )
-                release_and_exit(futures)
+                _release_and_exit(futures)
 
 
 if __name__ == "__main__":

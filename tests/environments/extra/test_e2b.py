@@ -52,6 +52,23 @@ def _make_manager(**kwargs) -> E2BTemplateManager:
     return E2BTemplateManager(E2BEnvironmentConfig(image="swebench/test-image:latest", **kwargs))
 
 
+@pytest.fixture(autouse=True)
+def _isolate_sandbox_registry():
+    from minisweagent.environments.extra import e2b as e2b_mod
+
+    with e2b_mod._sandbox_registry:
+        e2b_mod._active_sandboxes.clear()
+        e2b_mod._killing_sandboxes.clear()
+        e2b_mod._creating_sandboxes = 0
+        e2b_mod._shutting_down = False
+    yield
+    with e2b_mod._sandbox_registry:
+        e2b_mod._active_sandboxes.clear()
+        e2b_mod._killing_sandboxes.clear()
+        e2b_mod._creating_sandboxes = 0
+        e2b_mod._shutting_down = False
+
+
 class TestE2BEnvironmentConfig:
     def test_defaults(self):
         cfg = E2BEnvironmentConfig(image="python:3.11")
@@ -188,6 +205,24 @@ class TestGetOrBuild:
                 _make_manager(skip_cache=True, **{field: value}).get_or_build("swebench/test-image:latest")
         assert len(rebuilt) == 2
         e2b_mod._force_rebuilt.clear()
+
+    @pytest.mark.parametrize(
+        ("variable", "values"),
+        [
+            ("E2B_API_KEY", ("environment-account-one", "environment-account-two")),
+            ("E2B_DOMAIN", ("one.example.com", "two.example.com")),
+            ("E2B_API_URL", ("https://api.one.example.com", "https://api.two.example.com")),
+        ],
+    )
+    def test_forced_rebuild_uses_environment_connection(self, monkeypatch, variable, values):
+        keys = []
+        for value in values:
+            monkeypatch.setenv(variable, value)
+            keys.append(_make_manager()._rebuild_key("template"))
+
+        assert keys[0] != keys[1]
+        if variable == "E2B_API_KEY":
+            assert all(value not in str(keys) for value in values)
 
 
 class TestRepair:
@@ -532,15 +567,15 @@ class TestE2BEnvironmentCleanup:
         from minisweagent.environments.extra import e2b as e2b_mod
 
         env = _make_env()
-        e2b_mod._active_sandboxes.add(env)
+        sandbox = env.sandbox
         env.sandbox.kill.side_effect = [RuntimeError("503"), None]
 
         env.cleanup()
-        assert env in e2b_mod._active_sandboxes
+        assert sandbox in e2b_mod._active_sandboxes
 
         env.cleanup()
         assert env.sandbox.kill.call_count == 2
-        assert env not in e2b_mod._active_sandboxes
+        assert sandbox not in e2b_mod._active_sandboxes
 
     def test_failed_kill_from_del_is_retried_at_exit(self):
         # The path that actually leaks: `__del__` runs, the kill fails, and the environment is
@@ -553,7 +588,7 @@ class TestE2BEnvironmentCleanup:
 
         attempts = []
 
-        def flaky_kill():
+        def flaky_kill(**kwargs):
             attempts.append(1)
             if len(attempts) == 1:
                 raise RuntimeError("503")
@@ -562,17 +597,16 @@ class TestE2BEnvironmentCleanup:
         sandbox = env.sandbox
         sandbox.kill = flaky_kill
         env.logger = _SilentLogger()
-        e2b_mod._active_sandboxes.add(env)
 
         del env
         gc.collect()
 
         assert attempts == [1]
-        assert sandbox in e2b_mod._pending_kills
+        assert sandbox in e2b_mod._active_sandboxes
 
-        e2b_mod._cleanup_all_sandboxes()
+        e2b_mod.shutdown_active_sandboxes()
         assert len(attempts) == 2
-        assert sandbox not in e2b_mod._pending_kills
+        assert sandbox not in e2b_mod._active_sandboxes
 
 
 class TestAtexitCleanup:
@@ -580,21 +614,21 @@ class TestAtexitCleanup:
         from minisweagent.environments.extra import e2b as e2b_mod
 
         env = _make_env()
-        e2b_mod._active_sandboxes.add(env)
+        e2b_mod._active_sandboxes.add(env.sandbox)
         env.cleanup()
-        assert env not in e2b_mod._active_sandboxes
+        assert env.sandbox not in e2b_mod._active_sandboxes
 
     def test_cleanup_all_sandboxes_kills_all(self):
         from minisweagent.environments.extra import e2b as e2b_mod
 
         env1, env2 = _make_env(), _make_env()
-        e2b_mod._active_sandboxes.update([env1, env2])
+        e2b_mod._active_sandboxes.update([env1.sandbox, env2.sandbox])
 
-        e2b_mod._cleanup_all_sandboxes()
+        e2b_mod.shutdown_active_sandboxes()
 
         env1.sandbox.kill.assert_called_once()
         env2.sandbox.kill.assert_called_once()
-        assert env1 not in e2b_mod._active_sandboxes and env2 not in e2b_mod._active_sandboxes
+        assert env1.sandbox not in e2b_mod._active_sandboxes and env2.sandbox not in e2b_mod._active_sandboxes
 
     def test_dropped_environment_kills_its_sandbox(self):
         # The registry must not keep the environment alive: a strong one holds every
@@ -605,9 +639,50 @@ class TestAtexitCleanup:
 
         env = _make_env()
         sandbox = env.sandbox
-        e2b_mod._active_sandboxes.add(env)
+        e2b_mod._active_sandboxes.add(sandbox)
 
         del env
         gc.collect()
 
         sandbox.kill.assert_called_once()
+
+    def test_shutdown_starts_all_kills_before_its_deadline(self):
+        from minisweagent.environments.extra import e2b as e2b_mod
+
+        release = threading.Event()
+        started = []
+
+        def blocking_kill(sandbox_id):
+            started.append(sandbox_id)
+            release.wait()
+
+        sandboxes = [MagicMock(sandbox_id=f"sbx-{i}") for i in range(3)]
+        for sandbox in sandboxes:
+            sandbox.kill.side_effect = lambda sandbox_id=sandbox.sandbox_id, **kwargs: blocking_kill(sandbox_id)
+        e2b_mod._active_sandboxes.update(sandboxes)
+
+        before = time.monotonic()
+        e2b_mod.shutdown_active_sandboxes(timeout=0.1)
+        elapsed = time.monotonic() - before
+        release.set()
+
+        assert sorted(started) == ["sbx-0", "sbx-1", "sbx-2"]
+        assert elapsed < 0.3
+        assert all(0 < sandbox.kill.call_args.kwargs["request_timeout"] <= 0.1 for sandbox in sandboxes)
+
+    def test_shutdown_waits_for_in_flight_creation_and_blocks_new_ones(self):
+        from minisweagent.environments.extra import e2b as e2b_mod
+
+        e2b_mod._begin_sandbox_creation()
+        shutdown = threading.Thread(target=e2b_mod.shutdown_active_sandboxes, kwargs={"timeout": 1})
+        shutdown.start()
+        while not e2b_mod._shutting_down:
+            time.sleep(0.001)
+
+        sandbox = MagicMock(sandbox_id="created-during-shutdown")
+        e2b_mod._finish_sandbox_creation(sandbox)
+        shutdown.join()
+
+        sandbox.kill.assert_called_once()
+        with pytest.raises(RuntimeError, match="shutdown is in progress"):
+            e2b_mod._begin_sandbox_creation()

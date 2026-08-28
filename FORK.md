@@ -31,7 +31,8 @@ The change set, spread over a few `feat(env):` commits:
   instance. Waiting out a grace period first has the order wrong: the scheduler follows
   SIGTERM with SIGKILL after its own window, and Kubernetes defaults to 30s -- less than a
   single agent step on a large repository -- so the kill requests might never be sent at
-  all. Interrupting therefore cancels everything, releases every sandbox and exits 130.
+  all. Interrupting therefore cancels everything, sends sandbox kills concurrently within
+  a 20-second deadline and exits 130.
   The in-flight work is dropped, trajectory included: in batch mode that file is written
   once at the end. `preds.json` is written per instance, so re-running the same command
   picks up exactly the instances that did not finish.
@@ -103,16 +104,15 @@ evaluation images. Each is generic — none of them mention any particular cloud
     completely: commands succeed in the empty directory, and the agent runs to completion
     and submits an empty patch. The directory is now probed before it is created, and
     `require_existing_cwd` turns that into a hard failure for repository-based benchmarks.
-11. **The registry of live sandboxes holds weak references.** PR 792 keeps them in a plain
-    `set`, which holds every reference count above zero and therefore makes `__del__`
+11. **The registry holds sandbox handles, not environments.** PR 792 keeps environments in
+    a plain `set`, which holds every reference count above zero and therefore makes `__del__`
     unreachable: an environment nobody holds on to any more keeps its sandbox running --
-    and billed -- until the process ends. Measured: three environments dropped, followed
-    by `gc.collect()`, left all three sandboxes alive. A `WeakSet` restores the finaliser
-    while `atexit` keeps covering the environments that are still alive. Restoring the
-    finaliser needs two things alongside it. `cleanup()` treats only a *returned* kill as
-    terminal; on an exception the sandbox *handle* is parked for `atexit` to retry -- keeping
-    the environment in the registry would do nothing, since coming in from the finaliser the
-    entry disappears the moment it returns. And `__del__` does nothing while
+    and billed -- until the process ends. Keeping only the sandbox handle leaves the
+    environment collectable and preserves what `atexit` needs to retry a failed kill. A
+    condition protects registration and cleanup from worker/SIGTERM races; shutdown blocks
+    new creates, waits up to its deadline for in-flight creates, and sends every registered
+    kill concurrently. `cleanup()` treats only a *returned* kill as terminal. And `__del__`
+    does nothing while
     `sys.is_finalizing()`: the SDK's native runtime is already torn down by then, so a request
     from there ends the process with SIGSEGV -- correct output, exit code 139, which quietly
     breaks any `a.py && b.py` chain.
