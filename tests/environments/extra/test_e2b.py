@@ -670,6 +670,25 @@ class TestAtexitCleanup:
         assert elapsed < 0.3
         assert all(0 < sandbox.kill.call_args.kwargs["request_timeout"] <= 0.1 for sandbox in sandboxes)
 
+    def test_shutdown_returns_when_kill_workers_finish(self, monkeypatch):
+        from minisweagent.environments.extra import e2b as e2b_mod
+
+        original = e2b_mod._kill_for_shutdown
+        release = threading.Event()
+
+        def delayed_return(sandbox, deadline):
+            original(sandbox, deadline)
+            release.wait()
+
+        monkeypatch.setattr(e2b_mod, "_kill_for_shutdown", delayed_return)
+        e2b_mod._active_sandboxes.add(MagicMock(sandbox_id="sbx-test"))
+        threading.Timer(0.05, release.set).start()
+
+        before = time.monotonic()
+        e2b_mod.shutdown_active_sandboxes(timeout=0.5)
+
+        assert time.monotonic() - before < 0.3
+
     def test_shutdown_waits_for_in_flight_creation_and_blocks_new_ones(self):
         from minisweagent.environments.extra import e2b as e2b_mod
 

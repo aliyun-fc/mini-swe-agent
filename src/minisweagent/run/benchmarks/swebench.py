@@ -66,6 +66,34 @@ DATASET_MAPPING = {
 
 app = typer.Typer(rich_markup_mode="rich", add_completion=False)
 _OUTPUT_FILE_LOCK = threading.Lock()
+_ENVIRONMENT_REGISTRY = threading.Condition()
+_ACTIVE_ENVIRONMENTS: dict[int, Environment] = {}
+_CREATING_ENVIRONMENTS = 0
+_SHUTTING_DOWN = False
+_SHUTDOWN_TIMEOUT = 20.0
+
+
+def _begin_environment_creation() -> None:
+    global _CREATING_ENVIRONMENTS
+    with _ENVIRONMENT_REGISTRY:
+        if _SHUTTING_DOWN:
+            raise RuntimeError("Cannot create an environment while shutdown is in progress")
+        _CREATING_ENVIRONMENTS += 1
+
+
+def _finish_environment_creation() -> None:
+    global _CREATING_ENVIRONMENTS
+    with _ENVIRONMENT_REGISTRY:
+        _CREATING_ENVIRONMENTS -= 1
+        _ENVIRONMENT_REGISTRY.notify_all()
+
+
+def _register_environment(env: Environment) -> bool:
+    with _ENVIRONMENT_REGISTRY:
+        if _SHUTTING_DOWN:
+            return False
+        _ACTIVE_ENVIRONMENTS[id(env)] = env
+        return True
 
 
 def get_swebench_docker_image_name(instance: dict) -> str:
@@ -88,7 +116,14 @@ def get_sb_environment(config: dict, instance: dict) -> Environment:
     elif env_config["environment_class"] in ["singularity", "contree"]:
         env_config["image"] = "docker://" + image_name
 
-    env = get_environment(env_config)
+    _begin_environment_creation()
+    try:
+        env = get_environment(env_config)
+        if not _register_environment(env):
+            _teardown_resource(env)
+            raise RuntimeError("Environment creation finished while shutdown was in progress")
+    finally:
+        _finish_environment_creation()
     if startup_command := config.get("run", {}).get("env_startup_command"):
         startup_command = Template(startup_command, undefined=StrictUndefined).render(**instance)
         try:
@@ -128,6 +163,13 @@ def remove_from_preds_file(output_path: Path, instance_id: str):
             output_path.write_text(json.dumps(output_data, indent=2))
 
 
+def _teardown_resource(env: Environment) -> None:
+    for teardown_name in ("cleanup", "stop"):
+        if callable(teardown := getattr(env, teardown_name, None)):
+            teardown()
+            break
+
+
 def _teardown_environment(env: Environment | None) -> None:
     """Release the per-instance environment resource (container / cloud sandbox).
 
@@ -136,19 +178,40 @@ def _teardown_environment(env: Environment | None) -> None:
     """
     if env is None:
         return
-    for teardown_name in ("cleanup", "stop"):
-        if callable(teardown := getattr(env, teardown_name, None)):
-            teardown()
-            break
+    with _ENVIRONMENT_REGISTRY:
+        registered = _ACTIVE_ENVIRONMENTS.pop(id(env), None)
+        if registered is not env and _SHUTTING_DOWN:
+            return
+    _teardown_resource(env)
+
+
+def _shutdown_active_environments(timeout: float = _SHUTDOWN_TIMEOUT) -> None:
+    """Release all registered environments within one process-wide deadline."""
+    global _SHUTTING_DOWN
+    deadline = time.monotonic() + timeout
+    with _ENVIRONMENT_REGISTRY:
+        _SHUTTING_DOWN = True
+        environments = list(_ACTIVE_ENVIRONMENTS.values())
+
+    workers = [threading.Thread(target=_teardown_environment, args=(env,), daemon=True) for env in environments]
+    for worker in workers:
+        worker.start()
+
+    from minisweagent.environments.extra.e2b import shutdown_active_sandboxes
+
+    shutdown_active_sandboxes(max(0, deadline - time.monotonic()))
+    for worker in workers:
+        worker.join(max(0, deadline - time.monotonic()))
+    with _ENVIRONMENT_REGISTRY:
+        while _CREATING_ENVIRONMENTS and (remaining := deadline - time.monotonic()) > 0:
+            _ENVIRONMENT_REGISTRY.wait(remaining)
 
 
 def _release_and_exit(futures: dict[concurrent.futures.Future, str]) -> None:
-    """Cancel work, release E2B sandboxes within their deadline, and hard-exit."""
-    from minisweagent.environments.extra.e2b import shutdown_active_sandboxes
-
+    """Cancel work, release active environments within their deadline, and hard-exit."""
     for future in futures:
         future.cancel()
-    shutdown_active_sandboxes()
+    _shutdown_active_environments()
     sys.stdout.flush()
     sys.stderr.flush()
     os._exit(130)
@@ -309,13 +372,11 @@ def main(
 
     with Live(progress_manager.render_group, refresh_per_second=4):
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = {
-                executor.submit(process_instance, instance, output_path, config, progress_manager): instance[
-                    "instance_id"
-                ]
-                for instance in instances
-            }
+            futures = {}
             try:
+                for instance in instances:
+                    future = executor.submit(process_instance, instance, output_path, config, progress_manager)
+                    futures[future] = instance["instance_id"]
                 process_futures(futures)
             except KeyboardInterrupt:
                 logger.info(

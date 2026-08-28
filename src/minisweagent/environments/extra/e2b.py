@@ -66,29 +66,25 @@ def _finish_sandbox_kill(sandbox, success: bool) -> None:
 def _kill_for_shutdown(sandbox, deadline: float) -> None:
     """Make one deadline-bound kill attempt, even if worker cleanup is already stuck."""
     owned = False
-    try:
-        with _sandbox_registry:
-            if sandbox in _active_sandboxes:
-                _active_sandboxes.remove(sandbox)
-                _killing_sandboxes.add(sandbox)
-                owned = True
-            elif sandbox not in _killing_sandboxes:
-                return
-        if (remaining := deadline - time.monotonic()) <= 0:
-            if owned:
-                _finish_sandbox_kill(sandbox, False)
+    with _sandbox_registry:
+        if sandbox in _active_sandboxes:
+            _active_sandboxes.remove(sandbox)
+            _killing_sandboxes.add(sandbox)
+            owned = True
+        elif sandbox not in _killing_sandboxes:
             return
-        try:
-            sandbox.kill(request_timeout=remaining)
-        except Exception:
-            if owned:
-                _finish_sandbox_kill(sandbox, False)
-        else:
-            if owned:
-                _finish_sandbox_kill(sandbox, True)
-    finally:
-        with _sandbox_registry:
-            _sandbox_registry.notify_all()
+    if (remaining := deadline - time.monotonic()) <= 0:
+        if owned:
+            _finish_sandbox_kill(sandbox, False)
+        return
+    try:
+        sandbox.kill(request_timeout=remaining)
+    except Exception:
+        if owned:
+            _finish_sandbox_kill(sandbox, False)
+    else:
+        if owned:
+            _finish_sandbox_kill(sandbox, True)
 
 
 def shutdown_active_sandboxes(timeout: float = _CLEANUP_TIMEOUT) -> None:
@@ -115,13 +111,17 @@ def shutdown_active_sandboxes(timeout: float = _CLEANUP_TIMEOUT) -> None:
             worker.start()
 
         with _sandbox_registry:
-            unfinished = any(worker.is_alive() for worker in workers)
             unclaimed = bool((_active_sandboxes | _killing_sandboxes) - attempted)
-            if not unfinished and not unclaimed and _creating_sandboxes == 0:
-                return
+            if not unclaimed and _creating_sandboxes == 0:
+                break
             if (remaining := deadline - time.monotonic()) <= 0:
                 return
             _sandbox_registry.wait(remaining)
+
+    for worker in workers:
+        if (remaining := deadline - time.monotonic()) <= 0:
+            return
+        worker.join(remaining)
 
 
 atexit.register(shutdown_active_sandboxes)
