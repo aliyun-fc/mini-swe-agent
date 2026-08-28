@@ -25,14 +25,16 @@ The change set, spread over a few `feat(env):` commits:
 - `src/minisweagent/environments/extra/e2b.py` — new environment class.
 - `src/minisweagent/environments/__init__.py` — registers the `e2b` key.
 - `src/minisweagent/run/benchmarks/swebench.py` — per-instance image injection for `e2b`,
-  plus `_teardown_environment()` so the sandbox is released on every exit path, and a
-  bounded shutdown on SIGTERM. `atexit` does not run on SIGTERM, so a scheduler or CI
+  plus `_teardown_environment()` so the sandbox is released on every exit path, and an
+  immediate release on SIGTERM. `atexit` does not run on SIGTERM, so a scheduler or CI
   timeout would otherwise leave one running -- and billed -- cloud sandbox per in-flight
-  instance. Pending instances are cancelled, the running ones get
-  `MSWEA_SHUTDOWN_GRACE_SECONDS` (120s) to submit, and past that their environments are
-  released and the process exits 130. The deadline is the point: simply taking the `^C`
-  path waits for every running instance, so a scheduler that follows its own grace period
-  with SIGKILL still leaks their sandboxes.
+  instance. Waiting out a grace period first has the order wrong: the scheduler follows
+  SIGTERM with SIGKILL after its own window, and Kubernetes defaults to 30s -- less than a
+  single agent step on a large repository -- so the kill requests might never be sent at
+  all. Interrupting therefore cancels everything, releases every sandbox and exits 130.
+  The in-flight work is dropped, trajectory included: in batch mode that file is written
+  once at the end. `preds.json` is written per instance, so re-running the same command
+  picks up exactly the instances that did not finish.
 - `pyproject.toml` — new `e2b` extra, also pulled into `full`.
 - Docs, `mkdocs.yml` nav, `README.md`, and tests for the above.
 
@@ -86,8 +88,9 @@ evaluation images. Each is generic — none of them mention any particular cloud
    and not merely the wait -- a pooled worker cannot be cancelled once started and the
    interpreter joins it on exit (measured: logic done at 1.0s, process at 8.2s) -- and the
    once-per-process bookkeeping for `skip_cache` is recorded only after the rebuild lands,
-   keyed by control plane. The template name hashes just the image and its build
-   parameters, so a single shared key would rebuild on the first control plane only.
+   keyed per account (domain, api url and a hash of the api key). The template name hashes
+   just the image and its build parameters, so a single shared key would rebuild on the first
+   account only -- two api keys on one domain are two template namespaces.
 9. **A timed-out command keeps the output it already produced.** PR 792 hard-codes
    `"output": ""` on the generic exception path, and the SDK's timeout carries no
    stdout/stderr at all, so everything printed before the deadline was lost — worst exactly
@@ -107,11 +110,12 @@ evaluation images. Each is generic — none of them mention any particular cloud
     by `gc.collect()`, left all three sandboxes alive. A `WeakSet` restores the finaliser
     while `atexit` keeps covering the environments that are still alive. Restoring the
     finaliser needs two things alongside it. `cleanup()` treats only a *returned* kill as
-    terminal -- an exception leaves the environment in the registry for `atexit` to retry,
-    since swallowing it would let one transient API error keep the sandbox billed until its
-    TTL. And `__del__` does nothing while `sys.is_finalizing()`: the SDK's native runtime is
-    already torn down by then, so a request from there ends the process with SIGSEGV --
-    correct output, exit code 139, which quietly breaks any `a.py && b.py` chain.
+    terminal; on an exception the sandbox *handle* is parked for `atexit` to retry -- keeping
+    the environment in the registry would do nothing, since coming in from the finaliser the
+    entry disappears the moment it returns. And `__del__` does nothing while
+    `sys.is_finalizing()`: the SDK's native runtime is already torn down by then, so a request
+    from there ends the process with SIGSEGV -- correct output, exit code 139, which quietly
+    breaks any `a.py && b.py` chain.
 12. **A negative exit code is labelled as a signal.** The SDK reports `exit_code == -1` for
     every signal, and -1 is also what this class returns for an infrastructure error, so an
     empty `exception_info` would claim a killed interpreter was an ordinary command result.
