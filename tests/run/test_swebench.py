@@ -1,6 +1,7 @@
 import json
 import re
-from unittest.mock import MagicMock, patch
+import signal
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 from pydantic import BaseModel
@@ -8,6 +9,9 @@ from pydantic import BaseModel
 from minisweagent import package_dir
 from minisweagent.models.test_models import DeterministicModel, make_output
 from minisweagent.run.benchmarks.swebench import (
+    _register_environment,
+    _release_and_exit,
+    _teardown_environment,
     filter_instances,
     get_sb_environment,
     get_swebench_docker_image_name,
@@ -15,6 +19,60 @@ from minisweagent.run.benchmarks.swebench import (
     remove_from_preds_file,
     update_preds_file,
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_environment_registry():
+    from minisweagent.run.benchmarks import swebench
+
+    with swebench._ENVIRONMENT_REGISTRY:
+        swebench._ACTIVE_ENVIRONMENTS.clear()
+        swebench._CREATING_ENVIRONMENTS = 0
+        swebench._SHUTTING_DOWN = False
+    yield
+    with swebench._ENVIRONMENT_REGISTRY:
+        swebench._ACTIVE_ENVIRONMENTS.clear()
+        swebench._CREATING_ENVIRONMENTS = 0
+        swebench._SHUTTING_DOWN = False
+
+
+class TestTeardownEnvironment:
+    def test_prefers_cleanup_over_stop(self):
+        env = MagicMock(spec=["cleanup", "stop"])
+        _teardown_environment(env)
+        env.cleanup.assert_called_once()
+        env.stop.assert_not_called()
+
+    def test_falls_back_to_stop(self):
+        env = MagicMock(spec=["stop"])
+        _teardown_environment(env)
+        env.stop.assert_called_once()
+
+    def test_tolerates_env_without_teardown(self):
+        _teardown_environment(MagicMock(spec=[]))  # must not raise
+
+    def test_tolerates_none(self):
+        _teardown_environment(None)  # must not raise
+
+
+def test_release_and_exit_cleans_all_environments_before_hard_exit():
+    future = MagicMock()
+    env = MagicMock(spec=["cleanup"])
+    live = MagicMock(spec=["stop"])
+    _register_environment(env)
+    with (
+        patch("minisweagent.environments.extra.e2b.shutdown_active_sandboxes") as cleanup,
+        patch("minisweagent.run.benchmarks.swebench.os._exit") as hard_exit,
+        patch("minisweagent.run.benchmarks.swebench.signal.signal") as set_signal,
+    ):
+        _release_and_exit({future: "instance"}, live)
+
+    assert set_signal.call_args_list == [call(signal.SIGINT, signal.SIG_IGN), call(signal.SIGTERM, signal.SIG_IGN)]
+    live.stop.assert_called_once()
+    future.cancel.assert_called_once()
+    env.cleanup.assert_called_once()
+    cleanup.assert_called_once()
+    hard_exit.assert_called_once_with(130)
 
 
 def _make_model_from_fixture(text_outputs: list[str], cost_per_call: float = 1.0, **kwargs) -> DeterministicModel:
@@ -130,6 +188,18 @@ def test_get_sb_environment_does_not_mutate_shared_config():
 
     assert mock_get_environment.call_args.args[0]["image"] == "custom/image:tag"
     assert "image" not in config["environment"]
+
+
+@pytest.mark.parametrize(("configured", "expected"), [(None, True), (False, False)])
+def test_get_sb_environment_requires_existing_cwd_for_e2b(configured, expected):
+    environment = {"environment_class": "e2b"}
+    if configured is not None:
+        environment["require_existing_cwd"] = configured
+
+    with patch("minisweagent.run.benchmarks.swebench.get_environment", return_value=MagicMock()) as create:
+        get_sb_environment({"environment": environment}, {"instance_id": "repo__test"})
+
+    assert create.call_args.args[0]["require_existing_cwd"] is expected
 
 
 def test_filter_instances_no_filters():
